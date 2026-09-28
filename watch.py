@@ -33,6 +33,7 @@ CODEX_EVERY = 300
 BAR_WIDTH = 24
 # cswap caches usage of inactive accounts for several minutes; only older data is news.
 STALE_AFTER = 15 * 60
+SOON_DAYS = 5
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -265,8 +266,12 @@ def subscription_text(subscription, now=None):
     today = now.astimezone().date()
     word = "продление" if subscription.get("kind") == "renews" else "оплачено до"
     text = f"{word} {day.strftime('%d.%m' if day.year == today.year else '%d.%m.%Y')}"
-    passed = day < today if date_only else until <= now
-    return (text + " — проверь", True) if passed else (text, False)
+    if (day < today) if date_only else (until <= now):
+        return text + " — проверь", True
+    days = (day - today).days
+    if days > SOON_DAYS:
+        return text, False
+    return text + (" (сегодня)" if days == 0 else " (завтра)" if days == 1 else f" ({days} дн.)"), True
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -298,9 +303,11 @@ def shared_domain(accounts):
     return domains.pop() if len(domains) == 1 and None not in domains else ""
 
 
-def pace_alert(w, now):
+def pace_alert(w, now, forecast=True):
     if w["pct"] >= 100:
         return f"{RED}■ исчерпан{RESET}"
+    if not forecast:
+        return ""
     runs_out = parse_date(w.get("runs_out_at"))
     if runs_out:
         left = (runs_out - now).total_seconds()
@@ -357,23 +364,26 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
                                                      acc.get("subscription")), now)
               for acc, _ in accounts]
     windows = [w for acc, _ in accounts for w in acc["windows"]]
+    # Providers project from the average pace since the window opened. On an idle
+    # account that never counts down, so only the active Claude account gets it.
+    alerts = [[pace_alert(w, now, acc["provider"] == "claude" and acc["active"]) for w in acc["windows"]]
+              for acc, _ in accounts]
 
     # Columns: slot | account | window label, percent, bar, time to reset | alert.
     name_w = max((visible(row) for rows in idents for row in rows), default=0)
     label_w = max((len(w["label"]) for w in windows), default=2)
     reset_w = max((len(countdown(w.get("resets_at"), now)) for w in windows), default=0)
-    alert_w = max((visible(pace_alert(w, now)) for w in windows), default=0)
+    alert_w = max((visible(alert) for row in alerts for alert in row), default=0)
     left_w = 5 + name_w + 3
     fixed = left_w + label_w + 2 + 4 + 2 + 3 + reset_w + (3 + alert_w if alert_w else 0)
     bar_w = max(10, min(BAR_WIDTH, width - fixed))
     alerts_inline = fixed + bar_w <= width
 
     blocks = []
-    for (acc, age), rows in zip(accounts, idents):
+    for (acc, age), rows, account_alerts in zip(accounts, idents, alerts):
         right = []
-        for w in acc["windows"]:
+        for w, alert in zip(acc["windows"], account_alerts):
             right.append(window_row(w, label_w, bar_w, reset_w, now))
-            alert = pace_alert(w, now)
             if alert and alerts_inline:
                 right[-1] += "   " + alert
             elif alert:
@@ -414,6 +424,16 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
     if not accounts:
         lines.append(f"  {RED}нет данных{RESET}")
     return "\n".join(clip_line(line, width) for line in lines + footer)
+
+
+def tab_title(claude, now=None):
+    active = next((a for a in claude or [] if a["active"] and a["windows"]), None)
+    if not active:
+        return "limits"
+    now = now or datetime.now(timezone.utc)
+    top = max(w["pct"] for w in active["windows"])
+    alarm = any(pace_alert(w, now) for w in active["windows"])
+    return f"limits · {active['email'].split('@')[0]} {top:.0f}%" + (" ▲" if alarm else "")
 
 
 def main():
@@ -477,11 +497,12 @@ def main():
             if once:
                 print(frame)
                 return 0 if any(a["windows"] for a in (claude or []) + (codex or [])) else 1
-            sys.stdout.write("\033[H\033[2J" + frame + "\n")
+            sys.stdout.write(f"\033]2;{tab_title(claude)}\007\033[H\033[2J" + frame + "\n")
             sys.stdout.flush()
             time.sleep(10)
     except KeyboardInterrupt:
-        sys.stdout.write("\n")
+        # An empty title hands the tab back to the shell's own title.
+        sys.stdout.write("\n" if once else "\033]2;\007\n")
         return 0
 
 

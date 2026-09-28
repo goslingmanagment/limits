@@ -148,6 +148,15 @@ class Subscriptions(unittest.TestCase):
         text, warn = watch.subscription_text({"until": "2027-01-15T10:00:00Z"}, datetime(2026, 9, 28, tzinfo=timezone.utc))
         self.assertEqual((text, warn), ("оплачено до 15.01.2027", False))
 
+    def test_dates_in_the_next_five_days_are_flagged(self):
+        now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+        def text(until):
+            return watch.subscription_text({"until": until, "kind": "renews"}, now)
+        self.assertEqual(text("2026-09-28"), ("продление 28.09 (сегодня)", True))
+        self.assertEqual(text("2026-09-29"), ("продление 29.09 (завтра)", True))
+        self.assertEqual(text("2026-10-03"), ("продление 03.10 (5 дн.)", True))
+        self.assertEqual(text("2026-10-04"), ("продление 04.10", False))
+
     def test_unknown_does_not_infer_from_creation_or_limit_reset(self):
         self.assertEqual(watch.subscription_text({"createdAt": "2026-09-10", "resetsAt": "2026-10-10"}),
                          ("нет даты подписки", False))
@@ -213,9 +222,35 @@ class Display(unittest.TestCase):
             with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((columns, 40))):
                 lines = watch.ANSI.sub("", watch.render(claude, codex, 0, 0, [])).splitlines()
             self.assertTrue(all(len(line) < columns for line in lines))
-            self.assertEqual(sum("кончится через ~21h" in line for line in lines), 2)
+            self.assertEqual(sum("кончится через ~21h" in line for line in lines), 1)
             self.assertTrue(next(l for l in lines if "alice" in l).lstrip().startswith("3  alice"))
             self.assertTrue(next(l for l in lines if "bob" in l).lstrip().startswith("bob"))
+
+    def test_forecast_only_for_the_active_claude_account(self):
+        now = datetime.now(timezone.utc)
+        window = {"pct": 82, "label": "7d", "resets_at": (now + timedelta(days=2)).isoformat(),
+                  "runs_out_at": (now + timedelta(hours=5)).isoformat(), "ahead": True}
+        spent = {"pct": 100, "label": "5h", "resets_at": (now + timedelta(hours=2)).isoformat()}
+        claude = [dict(provider="claude", email=f"{name}@example.com", slot=i, active=i == 1, windows=[window, spent])
+                  for i, name in ((1, "alice"), (2, "carol"))]
+        codex = [dict(provider="codex", email="bob@example.com", active=False, windows=[window])]
+        with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((120, 40))):
+            lines = watch.ANSI.sub("", watch.render(claude, codex, 0, 0, [])).splitlines()
+        forecasts = [line for line in lines if "кончится через" in line or "быстрее нормы" in line]
+        self.assertEqual(len(forecasts), 1)
+        self.assertIn("alice", forecasts[0])
+        self.assertEqual(sum("исчерпан" in line for line in lines), 2)
+
+    def test_tab_title_sums_up_the_active_account(self):
+        now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+        calm = {"pct": 36, "label": "7d"}
+        busy = {"pct": 82, "label": "7d", "runs_out_at": (now + timedelta(hours=5)).isoformat()}
+        def account(active, *windows):
+            return dict(provider="claude", email="alice@example.com", active=active, windows=list(windows))
+        self.assertEqual(watch.tab_title([account(True, {"pct": 9, "label": "Fable"}, calm)], now), "limits · alice 36%")
+        self.assertEqual(watch.tab_title([account(True, calm, busy)], now), "limits · alice 82% ▲")
+        self.assertEqual(watch.tab_title([account(False, busy)], now), "limits")
+        self.assertEqual(watch.tab_title(None, now), "limits")
 
     def test_account_column_stacks_plan_and_date_under_the_name(self):
         acc = dict(provider="codex", email="bob@example.com", plan="pro", active=False, windows=[],
@@ -225,7 +260,7 @@ class Display(unittest.TestCase):
         lines = [line.strip() for line in watch.ANSI.sub("", text).splitlines()]
         row = next(i for i, line in enumerate(lines) if line.startswith("bob"))
         self.assertEqual(lines[row + 1], "Pro")
-        self.assertEqual(lines[row + 2], "оплачено до 02.10")
+        self.assertEqual(lines[row + 2], "оплачено до 02.10 (4 дн.)")
 
     def test_email_domain_is_hidden_only_when_shared(self):
         same = [dict(email="a@gmail.com"), dict(email="b@Gmail.com")]
