@@ -34,6 +34,7 @@ BAR_WIDTH = 24
 # cswap caches usage of inactive accounts for several minutes; only older data is news.
 STALE_AFTER = 15 * 60
 SOON_DAYS = 5
+WEEK = timedelta(days=7)
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -43,6 +44,10 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 ORANGE = "\033[38;5;214m"
 CYAN = "\033[36m"
+
+
+class FetchError(Exception):
+    """A source gave no usable data; the message says why."""
 
 
 def run(cmd, timeout=180, env=None):
@@ -106,19 +111,22 @@ def local_clock(resets_at):
 
 def fetch_claude():
     out = run([binary(CSWAP, "cswap"), "list", "--json"], timeout=120)
-    if not out:
-        return None
     try:
         data = json.loads(out)
-    except Exception:
-        return None
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        raise FetchError("claude-swap: " + str(data["error"].get("message") or "ошибка"))
     if not isinstance(data, dict) or not isinstance(data.get("accounts"), list):
-        return None
+        raise FetchError("claude-swap не отвечает (cswap list --json)")
     accounts = []
     plans = claude_plans()
     for acc in data.get("accounts", []):
         windows = []
-        u = acc.get("usage") or {}
+        fresh = acc.get("usage")
+        # When a fetch fails cswap still reports the last good usage for display.
+        u = fresh if isinstance(fresh, dict) else acc.get("lastGoodUsage")
+        u = u if isinstance(u, dict) else {}
         named = [(u.get(key), label) for key, label in (("fiveHour", "5h"), ("sevenDay", "7d"))]
         named += [(sc, (sc.get("name") or "scoped")[:6]) for sc in u.get("scoped") or []
                   if isinstance(sc, dict)]
@@ -144,8 +152,8 @@ def fetch_claude():
                 "active": bool(acc.get("active")),
                 "slot": acc.get("number"),
                 "plan": plans.get(acc.get("email", "").casefold(), ""),
-                "fetched_at": acc.get("usageFetchedAt"),
-                "error": usage_error(acc.get("usageStatus")) if not windows else "",
+                "fetched_at": acc.get("usageFetchedAt" if isinstance(fresh, dict) else "lastGoodFetchedAt"),
+                "error": "" if isinstance(fresh, dict) and windows else usage_error(acc.get("usageStatus")),
                 "windows": windows,
             }
         )
@@ -158,6 +166,7 @@ def usage_error(status):
         "keychain_unavailable": "хранилище входа недоступно",
         "foreign_credential": "данные входа другого аккаунта",
         "no_credentials": "нет данных входа", "api_key": "API-ключ: подписочных лимитов нет",
+        "unavailable": "не удалось обновить",
     }.get(status, "лимиты не получены")
 
 
@@ -253,6 +262,28 @@ def merge_last_good(old, fresh):
             acc["windows"] = before["windows"]
             acc["fetched_at"] = before.get("fetched_at")
     return fresh
+
+
+def rolled(window, provider, now):
+    """The window as it is now if its reset has already passed.
+
+    Claude weekly limits keep a fixed 7-day cadence (cswap's menu bar rolls them
+    the same way). A 5h window, like any Codex window, starts again on first use.
+    """
+    moment = parse_date(window.get("resets_at"))
+    if not moment or moment > now:
+        return window
+    weekly = provider == "claude" and window["label"] != "5h"
+    following = moment + WEEK * ((now - moment) // WEEK + 1) if weekly else None
+    return dict(window, pct=0.0, ahead=False, runs_out_at=None,
+                resets_at=following and following.isoformat(),
+                clock=following and local_clock(following.isoformat()) or "")
+
+
+def roll_over(accounts, now):
+    if accounts is None:
+        return None
+    return [dict(acc, windows=[rolled(w, acc["provider"], now) for w in acc["windows"]]) for acc in accounts]
 
 
 def subscription_text(subscription, now=None):
@@ -459,34 +490,35 @@ def main():
     color = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
     claude = codex = None
     claude_at = codex_at = 0.0
-    failed = {"claude": False, "codex": False}
+    failed = {"claude": "", "codex": ""}
 
     try:
         while True:
             now = time.time()
             if not claude_at or now - claude_at >= CLAUDE_EVERY:
-                fresh = fetch_claude()
-                failed["claude"] = fresh is None
+                try:
+                    fresh, failed["claude"] = fetch_claude(), ""
+                except FetchError as error:
+                    fresh, failed["claude"] = None, str(error)
                 claude, claude_at = merge_last_good(claude, fresh), time.time()
             if not codex_at or now - codex_at >= CODEX_EVERY:
                 fresh = fetch_codex()
-                failed["codex"] = fresh is None
+                failed["codex"] = "" if fresh is not None else "CodexBar не отвечает (codexbar usage)"
                 codex, codex_at = merge_last_good(codex, fresh), time.time()
-            errors = []
-            if failed["claude"]:
-                errors.append("claude-swap не отвечает (cswap list --json)")
-            if failed["codex"]:
-                errors.append("CodexBar не отвечает (codexbar usage)")
+            errors = [message for message in failed.values() if message]
+            # Cached usage can outlive its window; show every window as it is now.
+            moment = datetime.now(timezone.utc)
+            shown_claude, shown_codex = roll_over(claude, moment), roll_over(codex, moment)
             if args.json:
-                accounts = (claude or []) + (codex or [])
+                accounts = (shown_claude or []) + (shown_codex or [])
                 for acc in accounts:
                     acc["subscription"] = subscriptions.get(
                         acc["provider"] + ":" + acc["email"].casefold(), acc.get("subscription"))
                 print(json.dumps({"accounts": accounts, "errors": errors}, ensure_ascii=False, indent=2))
                 return 0 if any(a["windows"] for a in accounts) else 1
             frame = render(
-                claude,
-                codex,
+                shown_claude,
+                shown_codex,
                 time.time() - claude_at if claude else None,
                 time.time() - codex_at if codex else None,
                 errors,
@@ -497,7 +529,7 @@ def main():
             if once:
                 print(frame)
                 return 0 if any(a["windows"] for a in (claude or []) + (codex or [])) else 1
-            sys.stdout.write(f"\033]2;{tab_title(claude)}\007\033[H\033[2J" + frame + "\n")
+            sys.stdout.write(f"\033]2;{tab_title(shown_claude)}\007\033[H\033[2J" + frame + "\n")
             sys.stdout.flush()
             time.sleep(10)
     except KeyboardInterrupt:

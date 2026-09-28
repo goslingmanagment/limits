@@ -107,6 +107,41 @@ class Accounts(unittest.TestCase):
         with patch.object(watch, "discover_codex", return_value=([], ["/test/orca/home"])), patch.object(watch, "run", side_effect=probe):
             watch.fetch_codex()
 
+    def test_last_good_usage_fills_in_when_cswap_cannot_fetch(self):
+        payload = {"accounts": [{"email": "a@example.com", "number": 1, "usageStatus": "unavailable", "usage": None,
+                                 "lastGoodUsage": {"sevenDay": {"pct": 40, "resetsAt": "2026-10-01T14:00:00Z"}},
+                                 "lastGoodFetchedAt": "2026-09-28T03:00:00Z"}]}
+        with patch.object(watch, "claude_plans", return_value={}), patch.object(watch, "run", return_value=json.dumps(payload)):
+            account = watch.fetch_claude()[0]
+        self.assertEqual([(w["label"], w["pct"]) for w in account["windows"]], [("7d", 40.0)])
+        self.assertEqual(account["fetched_at"], "2026-09-28T03:00:00Z")
+        notice = watch.notice_text(account, None, datetime(2026, 9, 28, 3, 20, tzinfo=timezone.utc))
+        self.assertEqual(notice, "не удалось обновить · последние данные 20m назад")
+
+    def test_cswap_error_is_reported_in_its_own_words(self):
+        envelope = {"schemaVersion": 1, "error": {"type": "ClaudeSwitchError", "message": "No accounts configured"}}
+        for out, message in ((json.dumps(envelope), "claude-swap: No accounts configured"),
+                             ("", "claude-swap не отвечает (cswap list --json)")):
+            with patch.object(watch, "run", return_value=out), self.assertRaises(watch.FetchError) as caught:
+                watch.fetch_claude()
+            self.assertEqual(str(caught.exception), message)
+
+    def test_passed_reset_shows_the_window_as_it_is_now(self):
+        now = datetime(2026, 9, 29, 15, 0, tzinfo=timezone.utc)
+        passed = (now - timedelta(hours=1)).isoformat()
+        week = {"label": "7d", "pct": 99, "resets_at": passed, "runs_out_at": passed, "ahead": True, "clock": "x"}
+        five = {"label": "5h", "pct": 70, "resets_at": passed}
+        later = {"label": "Fable", "pct": 35, "resets_at": (now + timedelta(days=1)).isoformat()}
+        claude = watch.roll_over([dict(provider="claude", windows=[week, five, later])], now)[0]["windows"]
+        self.assertEqual((claude[0]["pct"], claude[0]["runs_out_at"], claude[0]["ahead"]), (0.0, None, False))
+        self.assertEqual(watch.parse_date(claude[0]["resets_at"]), now - timedelta(hours=1) + timedelta(days=7))
+        self.assertEqual((claude[1]["pct"], claude[1]["resets_at"]), (0.0, None))
+        self.assertIs(claude[2], later)
+        codex = watch.roll_over([dict(provider="codex", windows=[week])], now)[0]["windows"][0]
+        self.assertEqual((codex["pct"], codex["resets_at"]), (0.0, None))
+        self.assertIsNone(watch.roll_over(None, now))
+        self.assertEqual(week["pct"], 99)
+
     def test_bad_window_does_not_hide_another_account(self):
         payload = [usage("a@example.com", "NaN"), usage("b@example.com", 10)]
         with patch.object(watch, "discover_codex", return_value=([], [])), patch.object(watch, "run", return_value=json.dumps(payload)):
