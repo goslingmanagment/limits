@@ -4,7 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -158,6 +158,69 @@ class Display(unittest.TestCase):
         self.assertLessEqual(len(text.splitlines()), 23)
         self.assertTrue(all(len(line) <= 119 for line in text.splitlines()))
         self.assertIn("codex1@example.com", text)
+
+    def test_reset_moment_is_rounded_and_relative(self):
+        now = datetime(2026, 9, 28, 12, 0).astimezone()
+        def at(days, hour, minute, second=0, micro=0):
+            return (now + timedelta(days=days)).replace(hour=hour, minute=minute, second=second, microsecond=micro).isoformat()
+        self.assertEqual(watch.when(at(0, 9, 59, 59, 900000), now), "сегодня 10:00")
+        self.assertEqual(watch.when(at(1, 17, 0), now), "завтра 17:00")
+        self.assertEqual(watch.when(at(2, 22, 0), now), "ср 22:00")
+        self.assertEqual(watch.when(at(7, 5, 20), now), "05.10 05:20")
+        self.assertEqual(watch.countdown(at(1, 22, 0), now), "1d 10h")
+
+    def test_alert_names_when_the_limit_runs_out(self):
+        now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+        soon = (now + timedelta(hours=1, minutes=18)).isoformat()
+        self.assertIn("хватит на ~1h 18m", watch.pace_alert({"pct": 99, "runs_out_at": soon}, now))
+        self.assertIn("исчерпан", watch.pace_alert({"pct": 100, "runs_out_at": soon}, now))
+        self.assertIn("быстрее нормы", watch.pace_alert({"pct": 40, "ahead": True, "runs_out_at": None}, now))
+        self.assertEqual(watch.pace_alert({"pct": 40, "runs_out_at": None}, now), "")
+
+    def test_claude_projection_only_when_it_runs_out_before_reset(self):
+        week = {"pct": 99, "resetsAt": "2026-09-29T14:00:00Z", "willLastToReset": False,
+                "projectedExhaustionAt": "2026-09-28T04:40:32Z"}
+        scoped = {"pct": 35, "name": "Fable", "willLastToReset": True,
+                  "projectedExhaustionAt": "2026-10-08T10:56:23Z"}
+        payload = {"accounts": [{"email": "a@example.com", "usage": {"sevenDay": week, "scoped": [scoped]}}]}
+        with patch.object(watch, "claude_plans", return_value={}), patch.object(watch, "run", return_value=json.dumps(payload)):
+            windows = watch.fetch_claude()[0]["windows"]
+        self.assertEqual([w["runs_out_at"] for w in windows], ["2026-09-28T04:40:32Z", None])
+
+    def test_codex_projection_is_anchored_to_the_fetch(self):
+        entry = usage("a@example.com", 40)
+        entry["pace"] = {"secondary": {"stage": "farAhead", "willLastToReset": False, "etaSeconds": 3600}}
+        with patch.object(watch, "discover_codex", return_value=([], [])), patch.object(watch, "run", return_value=json.dumps([entry])):
+            window = watch.fetch_codex()[0]["windows"][0]
+        left = (watch.parse_date(window["runs_out_at"]) - datetime.now(timezone.utc)).total_seconds()
+        self.assertTrue(3500 < left <= 3600)
+
+    def test_narrow_terminal_keeps_alerts_and_numbers_codex_rows_without_slots(self):
+        now = datetime.now(timezone.utc)
+        window = {"pct": 82, "label": "7d", "resets_at": (now + timedelta(days=2, hours=22)).isoformat(),
+                  "runs_out_at": (now + timedelta(hours=21, minutes=30)).isoformat()}
+        claude = [dict(provider="claude", email="claude@example.com", slot=3, plan="Max 20x", active=True, windows=[window])]
+        codex = [dict(provider="codex", email="codex@example.com", plan="pro", active=False, windows=[window])]
+        with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((92, 40))):
+            lines = watch.ANSI.sub("", watch.render(claude, codex, 0, 0, [])).splitlines()
+        self.assertTrue(all(len(line) <= 91 for line in lines))
+        self.assertEqual(sum("хватит на ~21h" in line for line in lines), 2)
+        self.assertTrue(next(l for l in lines if "claude@example.com" in l).lstrip().startswith("3"))
+        self.assertTrue(next(l for l in lines if "codex@example.com" in l).lstrip().startswith("codex@"))
+
+    def test_subscription_shares_the_account_line_when_wide(self):
+        acc = dict(provider="claude", email="a@example.com", active=False, windows=[])
+        with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((160, 40))):
+            text = watch.ANSI.sub("", watch.render([acc], [], 0, 0, []))
+        self.assertIn("подписка: дата неизвестна", next(l for l in text.splitlines() if "a@example.com" in l))
+
+    def test_normal_cache_age_is_not_reported(self):
+        now = datetime.now(timezone.utc)
+        def account(minutes):
+            return dict(provider="claude", email="a@example.com", active=False, windows=[],
+                        fetched_at=(now - timedelta(minutes=minutes)).isoformat())
+        self.assertNotIn("назад", "\n".join(watch.account_body(account(6), None, 20, now)))
+        self.assertIn("данные 20m назад", "\n".join(watch.account_body(account(20), None, 20, now)))
 
 
 if __name__ == "__main__":

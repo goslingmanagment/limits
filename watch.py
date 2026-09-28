@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from metadata import (claude_plans, discover_codex, load_subscriptions,
@@ -30,7 +30,10 @@ CSWAP = os.path.expanduser("~/.local/bin/cswap")
 CODEXBAR = "/opt/homebrew/bin/codexbar"
 CLAUDE_EVERY = 60
 CODEX_EVERY = 300
-BAR_WIDTH = 30
+BAR_WIDTH = 24
+# cswap caches usage of inactive accounts for several minutes; only older data is news.
+STALE_AFTER = 15 * 60
+WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -71,28 +74,41 @@ def percentage(value):
         return None
 
 
-def countdown(resets_at):
-    """'3d 5h' / '1h 14m' из ISO-времени."""
-    if not resets_at:
-        return ""
-    try:
-        s = str(resets_at).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return ""
-    delta = int((dt - datetime.now(timezone.utc)).total_seconds())
-    if delta <= 0:
-        return "сброс"
-    d, rem = divmod(delta, 86400)
-    h, rem = divmod(rem, 3600)
-    m = rem // 60
+def span(seconds):
+    """'1d 10h' / '3h 33m' / '12m'."""
+    d, rem = divmod(max(0, int(seconds)), 86400)
+    h, m = rem // 3600, rem % 3600 // 60
     if d:
         return f"{d}d {h}h"
     if h:
         return f"{h}h {m}m"
     return f"{m}m"
+
+
+def countdown(resets_at, now=None):
+    moment = parse_date(resets_at)
+    if not moment:
+        return ""
+    delta = (moment - (now or datetime.now(timezone.utc))).total_seconds()
+    return span(delta) if delta > 0 else "сейчас"
+
+
+def when(value, now=None):
+    """Local reset moment: 'сегодня 10:00' / 'завтра 17:00' / 'ср 22:00' / '05.10 05:20'."""
+    moment = parse_date(value)
+    if not moment:
+        return ""
+    # Providers report resets a few milliseconds off the minute; round, do not floor.
+    local = (moment + timedelta(seconds=30)).astimezone()
+    days = (local.date() - (now or datetime.now(timezone.utc)).astimezone().date()).days
+    clock = local.strftime("%H:%M")
+    if days == 0:
+        return f"сегодня {clock}"
+    if days == 1:
+        return f"завтра {clock}"
+    if 1 < days < 7:
+        return f"{WEEKDAYS[local.weekday()]} {clock}"
+    return local.strftime("%d.%m %H:%M")
 
 
 def local_clock(resets_at):
@@ -121,8 +137,10 @@ def fetch_claude():
     for acc in data.get("accounts", []):
         windows = []
         u = acc.get("usage") or {}
-        for key, label in (("fiveHour", "5h"), ("sevenDay", "7d")):
-            w = u.get(key)
+        named = [(u.get(key), label) for key, label in (("fiveHour", "5h"), ("sevenDay", "7d"))]
+        named += [(sc, (sc.get("name") or "scoped")[:6]) for sc in u.get("scoped") or []
+                  if isinstance(sc, dict)]
+        for w, label in named:
             if not isinstance(w, dict) or percentage(w.get("pct")) is None:
                 continue
             windows.append(
@@ -132,18 +150,8 @@ def fetch_claude():
                     "resets_at": w.get("resetsAt"),
                     "clock": local_clock(w.get("resetsAt")) or w.get("clock", ""),
                     "ahead": bool(w.get("aheadOfPace")),
-                }
-            )
-        for sc in u.get("scoped") or []:
-            if not isinstance(sc, dict) or percentage(sc.get("pct")) is None:
-                continue
-            windows.append(
-                {
-                    "label": (sc.get("name") or "scoped")[:6],
-                    "pct": float(sc["pct"]),
-                    "resets_at": sc.get("resetsAt"),
-                    "clock": local_clock(sc.get("resetsAt")) or sc.get("clock", ""),
-                    "ahead": bool(sc.get("aheadOfPace")),
+                    "runs_out_at": (w.get("projectedExhaustionAt")
+                                    if w.get("willLastToReset") is False else None),
                 }
             )
         accounts.append(
@@ -209,13 +217,18 @@ def fetch_codex():
             w = u.get(key)
             if not isinstance(w, dict) or percentage(w.get("usedPercent")) is None:
                 continue
+            p = pace.get(key) or {}
+            eta = percentage(p.get("etaSeconds"))
             windows.append(
                 {
                     "label": label,
                     "pct": float(w["usedPercent"]),
                     "resets_at": w.get("resetsAt"),
                     "clock": local_clock(w.get("resetsAt")) or w.get("resetDescription", ""),
-                    "ahead": (pace.get(key) or {}).get("stage") in ("ahead", "farAhead"),
+                    "ahead": p.get("stage") in ("ahead", "farAhead"),
+                    # CodexBar reports the ETA relative to this fetch.
+                    "runs_out_at": ((datetime.now(timezone.utc) + timedelta(seconds=eta)).isoformat()
+                                    if eta is not None and p.get("willLastToReset") is False else None),
                 }
             )
         label = entry.get("account") or ""
@@ -295,66 +308,99 @@ def clip_line(line, width):
     return "".join(parts) + RESET
 
 
-def render(claude, codex, claude_age, codex_age, errors, subscriptions=None):
+def visible(text):
+    return len(ANSI.sub("", text))
+
+
+def pace_alert(w, now):
+    if w["pct"] >= 100:
+        return f"{RED}■ исчерпан{RESET}"
+    runs_out = parse_date(w.get("runs_out_at"))
+    if runs_out:
+        left = (runs_out - now).total_seconds()
+        return f"{ORANGE}▲ {'хватит на ~' + span(left) if left > 0 else 'на исходе'}{RESET}"
+    if w.get("ahead"):
+        return f"{ORANGE}▲ быстрее нормы{RESET}"
+    return ""
+
+
+def window_line(w, bar_width, now):
+    pct = w["pct"]
+    col = color_for(pct)
+    left = countdown(w.get("resets_at"), now)
+    moment = when(w.get("resets_at"), now) or w.get("clock", "")
+    reset = f"сброс {left} · {moment}" if left else moment
+    filled = max(0, min(bar_width, round(bar_width * pct / 100)))
+    bar = col + "━" * filled + RESET + DIM + "─" * (bar_width - filled) + RESET
+    line = f"      {w['label']:<6}{col}{pct:>4.0f}%{RESET}  {bar}  {DIM}{reset}{RESET}"
+    alert = pace_alert(w, now)
+    return line + " " * max(2, 30 - len(reset)) + alert if alert else line
+
+
+def account_head(acc):
+    mark = f"{ORANGE}●{RESET}" if acc["active"] else " "
+    slot = str(acc.get("slot") or "") if acc["provider"] == "claude" else ""
+    head = f"{slot:>3} {mark} {BOLD}{acc.get('label') or acc['email']}{RESET}"
+    return head + (f"  {DIM}{acc['plan']}{RESET}" if acc.get("plan") else "")
+
+
+def account_body(acc, age, bar_width, now):
+    observed = parse_date(acc.get("fetched_at"))
+    if observed:
+        age = (now - observed).total_seconds()
+    notice = acc.get("error", "")
+    if notice and acc["windows"]:
+        notice += " · последние данные" + (f" {span(age)} назад" if age is not None else "")
+    elif not notice and age is not None and age > STALE_AFTER:
+        notice = f"данные {span(age)} назад"
+    lines = [f"      {YELLOW}{notice}{RESET}"] if notice else []
+    lines += [window_line(w, bar_width, now) for w in acc["windows"]]
+    if not acc["windows"] and not acc.get("error"):
+        lines.append(f"      {DIM}лимиты не получены{RESET}")
+    return lines
+
+
+def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now=None):
     size = shutil.get_terminal_size((120, 40))
-    width = size.columns
+    width = max(1, size.columns - 1)
+    now = now or datetime.now(timezone.utc)
     subscriptions = subscriptions or {}
-    all_accounts = (claude or []) + (codex or [])
-    # Compact mode keeps all five accounts visible on a 24-line terminal.
-    needed = 3 + sum(2 + max(1, len(a["windows"])) + bool(a.get("error")) for a in all_accounts)
-    spacious = needed + len(all_accounts) < size.lines
-    lines = []
-    lines.append(f"{DIM}все аккаунты · claude + codex{RESET}")
-    if spacious:
-        lines.append("")
+    # Everything on a window line except the bar takes up to 71 cells.
+    bar_width = max(10, min(BAR_WIDTH, width - 71))
+    sections = [(title, group, age) for title, group, age in (
+        (f"{BOLD}{CYAN}CLAUDE{RESET}  {DIM}переключить: cswap switch <слот>{RESET}", claude, claude_age),
+        (f"{BOLD}{YELLOW}CODEX{RESET}", codex, codex_age),
+    ) if group]
+    accounts = [(acc, age) for _, group, age in sections for acc in group]
+    heads = [account_head(acc) for acc, _ in accounts]
+    subs = [f"{DIM}{subscription_text(subscriptions.get(acc['provider'] + ':' + acc['email'].casefold(), acc.get('subscription')), now)}{RESET}"
+            for acc, _ in accounts]
+    # Subscription dates share the account line in one column when every one fits.
+    column = max((visible(h) for h in heads), default=0) + 3
+    inline = all(column + visible(s) <= width for s in subs)
+    blocks = []
+    for (acc, age), head, sub in zip(accounts, heads, subs):
+        top = [head + " " * (column - visible(head)) + sub] if inline else [head, "      " + sub]
+        blocks.append(top + account_body(acc, age, bar_width, now))
 
-    n = 0
-    for acc in all_accounts:
-        n += 1
-        tag = f"{CYAN}claude{RESET}" if acc["provider"] == "claude" else f"{YELLOW}codex{RESET}"
-        age = claude_age if acc["provider"] == "claude" else codex_age
-        slot = acc.get("slot") or n
-        plan = acc.get("plan", "")
-        head = f" {BOLD}{slot}{RESET}  {BOLD}{acc.get('label') or acc['email']}{RESET}  [{tag}]"
-        if plan:
-            head += f" {DIM}{plan}{RESET}"
-        if acc["active"]:
-            head += f"  {ORANGE}● active{RESET}"
-        observed = parse_date(acc.get("fetched_at"))
-        if observed:
-            age = (datetime.now(timezone.utc) - observed).total_seconds()
-        stale_after = 120 if acc["provider"] == "claude" else 600
-        if age is not None and age > stale_after:
-            head += f"  {DIM}· {int(age // 60)}m назад{RESET}"
-        lines.append(head)
-        sub = subscriptions.get(acc["provider"] + ":" + acc["email"].casefold(), acc.get("subscription"))
-        lines.append(f"    {DIM}{subscription_text(sub)}{RESET}")
-        if acc.get("error"):
-            lines.append(f"    {YELLOW}{acc['error']}{' · последние данные' if acc['windows'] else ''}{RESET}")
-        for w in acc["windows"]:
-            pct = w["pct"]
-            col = color_for(pct)
-            bar_width = max(8, min(BAR_WIDTH, width - 64))
-            filled = max(0, min(bar_width, round(bar_width * pct / 100)))
-            bar = col + "━" * filled + RESET + DIM + "─" * (bar_width - filled) + RESET
-            cd = countdown(w["resets_at"])
-            tail = f"{DIM}сброс {cd} · {w['clock']}{RESET}" if cd else f"{DIM}{w['clock']}{RESET}"
-            ahead = f"  {ORANGE}↑ темп{RESET}" if w["ahead"] else ""
-            lines.append(f"    {w['label']:<6}{bar} {col}{pct:>4.0f}%{RESET}  {tail}{ahead}")
-        if not acc["windows"] and not acc.get("error"):
-            lines.append(f"    {DIM}лимиты не получены{RESET}")
-        if spacious:
+    footer = [""] + [f"  {RED}{e}{RESET}" for e in errors] + [
+        f"{DIM}обновлено {now.astimezone():%H:%M:%S} · даты подписок: limits --help · выход Ctrl-C{RESET}"]
+    # Blank lines between accounts only when everything still fits on the screen.
+    spacious = (len(sections) + sum(map(len, blocks)) + len(footer)
+                + len(blocks) + len(sections) - 1 < size.lines)
+    lines, i = [], 0
+    for title, group, _ in sections:
+        if lines and spacious:
             lines.append("")
-
-    if not n:
+        lines.append(title)
+        for block in blocks[i:i + len(group)]:
+            if spacious:
+                lines.append("")
+            lines += block
+        i += len(group)
+    if not accounts:
         lines.append(f"  {RED}нет данных{RESET}")
-        lines.append("")
-    for e in errors:
-        lines.append(f"  {RED}{e}{RESET}")
-    if errors:
-        lines.append("")
-    lines.append(f"{DIM}Claude: cswap switch <слот> · даты: limits --help · выход Ctrl-C{RESET}")
-    return "\n".join(clip_line(line, max(1, width - 1)) for line in lines)
+    return "\n".join(clip_line(line, width) for line in lines + footer)
 
 
 def main():
