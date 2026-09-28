@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -120,9 +121,9 @@ class Subscriptions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LIMITS_SUBSCRIPTIONS": tmp + "/dates.json"}):
             metadata.save_subscription("claude", "A@example.com", "2026-10-07", renews=True, source="billing")
             entry = metadata.load_subscriptions()["claude:a@example.com"]
-            text = watch.subscription_text(entry, now=datetime(2026, 11, 1, tzinfo=timezone.utc))
-            self.assertIn("07.10.2026", text)
-            self.assertIn("дата прошла", text)
+            text, warn = watch.subscription_text(entry, now=datetime(2026, 11, 1, tzinfo=timezone.utc))
+            self.assertEqual(text, "продление 07.10 — проверь")
+            self.assertTrue(warn)
             self.assertEqual(os.stat(tmp + "/dates.json").st_mode & 0o777, 0o600)
 
     def test_corrupt_dates_are_not_overwritten(self):
@@ -134,12 +135,22 @@ class Subscriptions(unittest.TestCase):
             self.assertEqual(path.read_text(), "broken")
 
     def test_date_only_is_not_shifted_by_timezone(self):
-        text = watch.subscription_text({"until": "2026-10-07", "kind": "renews"}, now=datetime(2026, 9, 28, tzinfo=timezone.utc))
-        self.assertIn("07.10.2026", text)
-        self.assertNotIn("00:00", text)
+        now = datetime(2026, 9, 28, tzinfo=timezone.utc)
+        try:
+            with patch.dict(os.environ, {"TZ": "America/Los_Angeles"}):
+                time.tzset()
+                text = watch.subscription_text({"until": "2026-10-07", "kind": "renews"}, now)
+        finally:
+            time.tzset()
+        self.assertEqual(text, ("продление 07.10", False))
+
+    def test_other_year_and_end_of_period_are_spelled_out(self):
+        text, warn = watch.subscription_text({"until": "2027-01-15T10:00:00Z"}, datetime(2026, 9, 28, tzinfo=timezone.utc))
+        self.assertEqual((text, warn), ("оплачено до 15.01.2027", False))
 
     def test_unknown_does_not_infer_from_creation_or_limit_reset(self):
-        self.assertEqual(watch.subscription_text({"createdAt": "2026-09-10", "resetsAt": "2026-10-10"}), "подписка: дата неизвестна")
+        self.assertEqual(watch.subscription_text({"createdAt": "2026-09-10", "resetsAt": "2026-10-10"}),
+                         ("нет даты подписки", False))
 
 
 class Display(unittest.TestCase):
@@ -157,22 +168,19 @@ class Display(unittest.TestCase):
             text = watch.ANSI.sub("", watch.render(claude, codex, 0, 0, []))
         self.assertLessEqual(len(text.splitlines()), 23)
         self.assertTrue(all(len(line) <= 119 for line in text.splitlines()))
-        self.assertIn("codex1@example.com", text)
+        self.assertIn("codex1", text)
 
-    def test_reset_moment_is_rounded_and_relative(self):
-        now = datetime(2026, 9, 28, 12, 0).astimezone()
-        def at(days, hour, minute, second=0, micro=0):
-            return (now + timedelta(days=days)).replace(hour=hour, minute=minute, second=second, microsecond=micro).isoformat()
-        self.assertEqual(watch.when(at(0, 9, 59, 59, 900000), now), "сегодня 10:00")
-        self.assertEqual(watch.when(at(1, 17, 0), now), "завтра 17:00")
-        self.assertEqual(watch.when(at(2, 22, 0), now), "ср 22:00")
-        self.assertEqual(watch.when(at(7, 5, 20), now), "05.10 05:20")
-        self.assertEqual(watch.countdown(at(1, 22, 0), now), "1d 10h")
+    def test_countdown(self):
+        now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(watch.countdown((now + timedelta(days=1, hours=10, minutes=5)).isoformat(), now), "1d 10h")
+        self.assertEqual(watch.countdown((now + timedelta(hours=3, minutes=12)).isoformat(), now), "3h 12m")
+        self.assertEqual(watch.countdown((now - timedelta(minutes=1)).isoformat(), now), "сейчас")
+        self.assertEqual(watch.countdown(None, now), "")
 
     def test_alert_names_when_the_limit_runs_out(self):
         now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
         soon = (now + timedelta(hours=1, minutes=18)).isoformat()
-        self.assertIn("хватит на ~1h 18m", watch.pace_alert({"pct": 99, "runs_out_at": soon}, now))
+        self.assertIn("кончится через ~1h 18m", watch.pace_alert({"pct": 99, "runs_out_at": soon}, now))
         self.assertIn("исчерпан", watch.pace_alert({"pct": 100, "runs_out_at": soon}, now))
         self.assertIn("быстрее нормы", watch.pace_alert({"pct": 40, "ahead": True, "runs_out_at": None}, now))
         self.assertEqual(watch.pace_alert({"pct": 40, "runs_out_at": None}, now), "")
@@ -195,32 +203,43 @@ class Display(unittest.TestCase):
         left = (watch.parse_date(window["runs_out_at"]) - datetime.now(timezone.utc)).total_seconds()
         self.assertTrue(3500 < left <= 3600)
 
-    def test_narrow_terminal_keeps_alerts_and_numbers_codex_rows_without_slots(self):
+    def test_alerts_stay_whole_and_only_claude_rows_have_slots(self):
         now = datetime.now(timezone.utc)
         window = {"pct": 82, "label": "7d", "resets_at": (now + timedelta(days=2, hours=22)).isoformat(),
                   "runs_out_at": (now + timedelta(hours=21, minutes=30)).isoformat()}
-        claude = [dict(provider="claude", email="claude@example.com", slot=3, plan="Max 20x", active=True, windows=[window])]
-        codex = [dict(provider="codex", email="codex@example.com", plan="pro", active=False, windows=[window])]
-        with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((92, 40))):
-            lines = watch.ANSI.sub("", watch.render(claude, codex, 0, 0, [])).splitlines()
-        self.assertTrue(all(len(line) <= 91 for line in lines))
-        self.assertEqual(sum("хватит на ~21h" in line for line in lines), 2)
-        self.assertTrue(next(l for l in lines if "claude@example.com" in l).lstrip().startswith("3"))
-        self.assertTrue(next(l for l in lines if "codex@example.com" in l).lstrip().startswith("codex@"))
+        claude = [dict(provider="claude", email="alice@example.com", slot=3, plan="Max 20x", active=True, windows=[window])]
+        codex = [dict(provider="codex", email="bob@example.com", plan="pro", active=False, windows=[window])]
+        for columns in (100, 80):
+            with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((columns, 40))):
+                lines = watch.ANSI.sub("", watch.render(claude, codex, 0, 0, [])).splitlines()
+            self.assertTrue(all(len(line) < columns for line in lines))
+            self.assertEqual(sum("кончится через ~21h" in line for line in lines), 2)
+            self.assertTrue(next(l for l in lines if "alice" in l).lstrip().startswith("3  alice"))
+            self.assertTrue(next(l for l in lines if "bob" in l).lstrip().startswith("bob"))
 
-    def test_subscription_shares_the_account_line_when_wide(self):
-        acc = dict(provider="claude", email="a@example.com", active=False, windows=[])
-        with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((160, 40))):
-            text = watch.ANSI.sub("", watch.render([acc], [], 0, 0, []))
-        self.assertIn("подписка: дата неизвестна", next(l for l in text.splitlines() if "a@example.com" in l))
+    def test_account_column_stacks_plan_and_date_under_the_name(self):
+        acc = dict(provider="codex", email="bob@example.com", plan="pro", active=False, windows=[],
+                   subscription={"until": "2026-10-02T20:04:00Z"})
+        with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((100, 40))):
+            text = watch.render([], [acc], 0, 0, [], now=datetime(2026, 9, 28, tzinfo=timezone.utc))
+        lines = [line.strip() for line in watch.ANSI.sub("", text).splitlines()]
+        row = next(i for i, line in enumerate(lines) if line.startswith("bob"))
+        self.assertEqual(lines[row + 1], "Pro")
+        self.assertEqual(lines[row + 2], "оплачено до 02.10")
+
+    def test_email_domain_is_hidden_only_when_shared(self):
+        same = [dict(email="a@gmail.com"), dict(email="b@Gmail.com")]
+        self.assertEqual(watch.shared_domain(same), "gmail.com")
+        self.assertEqual(watch.shared_domain(same + [dict(email="c@corp.com")]), "")
+        self.assertEqual(watch.shared_domain([dict(email="codex")]), "")
 
     def test_normal_cache_age_is_not_reported(self):
         now = datetime.now(timezone.utc)
         def account(minutes):
-            return dict(provider="claude", email="a@example.com", active=False, windows=[],
+            return dict(provider="claude", email="a@example.com", active=False, windows=[{"pct": 1, "label": "7d"}],
                         fetched_at=(now - timedelta(minutes=minutes)).isoformat())
-        self.assertNotIn("назад", "\n".join(watch.account_body(account(6), None, 20, now)))
-        self.assertIn("данные 20m назад", "\n".join(watch.account_body(account(20), None, 20, now)))
+        self.assertEqual(watch.notice_text(account(6), None, now), "")
+        self.assertEqual(watch.notice_text(account(20), None, now), "данные 20m назад")
 
 
 if __name__ == "__main__":

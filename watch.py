@@ -33,7 +33,6 @@ CODEX_EVERY = 300
 BAR_WIDTH = 24
 # cswap caches usage of inactive accounts for several minutes; only older data is news.
 STALE_AFTER = 15 * 60
-WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -91,24 +90,6 @@ def countdown(resets_at, now=None):
         return ""
     delta = (moment - (now or datetime.now(timezone.utc))).total_seconds()
     return span(delta) if delta > 0 else "сейчас"
-
-
-def when(value, now=None):
-    """Local reset moment: 'сегодня 10:00' / 'завтра 17:00' / 'ср 22:00' / '05.10 05:20'."""
-    moment = parse_date(value)
-    if not moment:
-        return ""
-    # Providers report resets a few milliseconds off the minute; round, do not floor.
-    local = (moment + timedelta(seconds=30)).astimezone()
-    days = (local.date() - (now or datetime.now(timezone.utc)).astimezone().date()).days
-    clock = local.strftime("%H:%M")
-    if days == 0:
-        return f"сегодня {clock}"
-    if days == 1:
-        return f"завтра {clock}"
-    if 1 < days < 7:
-        return f"{WEEKDAYS[local.weekday()]} {clock}"
-    return local.strftime("%d.%m %H:%M")
 
 
 def local_clock(resets_at):
@@ -274,23 +255,18 @@ def merge_last_good(old, fresh):
 
 
 def subscription_text(subscription, now=None):
-    if not subscription or not parse_date(subscription.get("until")):
-        return "подписка: дата неизвестна"
+    """Short paid-through date and whether it needs a look; never inferred from limits."""
+    until = parse_date((subscription or {}).get("until"))
+    if not until:
+        return "нет даты подписки", False
     now = now or datetime.now(timezone.utc)
-    value = subscription["until"]
-    until = parse_date(value)
-    date_only = len(value) == 10
-    days = ((until.date() if date_only else until.astimezone().date()) - now.astimezone().date()).days
-    date_text = until.strftime("%d.%m.%Y") if date_only else until.astimezone().strftime("%d.%m.%Y %H:%M")
-    word = "продление" if subscription.get("kind") == "renews" else "период до"
-    passed = days < 0 if date_only else until <= now
-    remaining = "дата прошла — проверь" if passed else f"через {days} дн." if days > 0 else "сегодня"
-    checked = parse_date(subscription.get("checked_at"))
-    evidence = ""
-    if checked:
-        prefix = "вход" if subscription.get("source") == "вход Codex" else "проверено"
-        evidence = f" · {prefix} {checked.astimezone():%d.%m}"
-    return f"{word} {date_text} · {remaining}{evidence}"
+    date_only = len(subscription["until"]) == 10
+    day = until.date() if date_only else until.astimezone().date()
+    today = now.astimezone().date()
+    word = "продление" if subscription.get("kind") == "renews" else "оплачено до"
+    text = f"{word} {day.strftime('%d.%m' if day.year == today.year else '%d.%m.%Y')}"
+    passed = day < today if date_only else until <= now
+    return (text + " — проверь", True) if passed else (text, False)
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -312,52 +288,60 @@ def visible(text):
     return len(ANSI.sub("", text))
 
 
+def pad(text, width):
+    return text + " " * (width - visible(text))
+
+
+def shared_domain(accounts):
+    """The email domain every account has, so the screen can leave it out."""
+    domains = {a["email"].casefold().rpartition("@")[2] if "@" in a["email"] else None for a in accounts}
+    return domains.pop() if len(domains) == 1 and None not in domains else ""
+
+
 def pace_alert(w, now):
     if w["pct"] >= 100:
         return f"{RED}■ исчерпан{RESET}"
     runs_out = parse_date(w.get("runs_out_at"))
     if runs_out:
         left = (runs_out - now).total_seconds()
-        return f"{ORANGE}▲ {'хватит на ~' + span(left) if left > 0 else 'на исходе'}{RESET}"
+        return f"{ORANGE}▲ {'кончится через ~' + span(left) if left > 0 else 'на исходе'}{RESET}"
     if w.get("ahead"):
         return f"{ORANGE}▲ быстрее нормы{RESET}"
     return ""
 
 
-def window_line(w, bar_width, now):
-    pct = w["pct"]
-    col = color_for(pct)
-    left = countdown(w.get("resets_at"), now)
-    moment = when(w.get("resets_at"), now) or w.get("clock", "")
-    reset = f"сброс {left} · {moment}" if left else moment
-    filled = max(0, min(bar_width, round(bar_width * pct / 100)))
-    bar = col + "━" * filled + RESET + DIM + "─" * (bar_width - filled) + RESET
-    line = f"      {w['label']:<6}{col}{pct:>4.0f}%{RESET}  {bar}  {DIM}{reset}{RESET}"
-    alert = pace_alert(w, now)
-    return line + " " * max(2, 30 - len(reset)) + alert if alert else line
-
-
-def account_head(acc):
-    mark = f"{ORANGE}●{RESET}" if acc["active"] else " "
-    slot = str(acc.get("slot") or "") if acc["provider"] == "claude" else ""
-    head = f"{slot:>3} {mark} {BOLD}{acc.get('label') or acc['email']}{RESET}"
-    return head + (f"  {DIM}{acc['plan']}{RESET}" if acc.get("plan") else "")
-
-
-def account_body(acc, age, bar_width, now):
+def notice_text(acc, age, now):
+    if not acc["windows"]:
+        return acc.get("error") or "лимиты не получены"
     observed = parse_date(acc.get("fetched_at"))
     if observed:
         age = (now - observed).total_seconds()
-    notice = acc.get("error", "")
-    if notice and acc["windows"]:
-        notice += " · последние данные" + (f" {span(age)} назад" if age is not None else "")
-    elif not notice and age is not None and age > STALE_AFTER:
-        notice = f"данные {span(age)} назад"
-    lines = [f"      {YELLOW}{notice}{RESET}"] if notice else []
-    lines += [window_line(w, bar_width, now) for w in acc["windows"]]
-    if not acc["windows"] and not acc.get("error"):
-        lines.append(f"      {DIM}лимиты не получены{RESET}")
-    return lines
+    if acc.get("error"):
+        return acc["error"] + " · последние данные" + (f" {span(age)} назад" if age is not None else "")
+    return f"данные {span(age)} назад" if age is not None and age > STALE_AFTER else ""
+
+
+def identity(acc, domain, subscription, now):
+    """Rows of the account column: name, plan, paid-through date."""
+    name = acc.get("label") or acc["email"]
+    if domain:
+        name = re.sub("@" + re.escape(domain), "", name, flags=re.IGNORECASE)
+    rows = [f"{BOLD}{name}{RESET}" + (f"  {CYAN}● активный{RESET}" if acc["active"] else "")]
+    plan = acc.get("plan") or ""
+    if plan:
+        rows.append(f"{DIM}{plan[0].upper() + plan[1:]}{RESET}")
+    text, warn = subscription_text(subscription, now)
+    return rows + [f"{YELLOW if warn else DIM}{text}{RESET}"]
+
+
+def window_row(w, label_w, bar_w, reset_w, now):
+    pct = w["pct"]
+    col = color_for(pct)
+    filled = max(0, min(bar_w, round(bar_w * pct / 100)))
+    bar = col + "━" * filled + RESET + DIM + "─" * (bar_w - filled) + RESET
+    number = f"{DIM if pct == 0 else BOLD + col}{pct:>3.0f}%{RESET}"
+    return (f"{w['label']:<{label_w}}  {number}  {bar}"
+            f"   {DIM}{countdown(w.get('resets_at'), now):>{reset_w}}{RESET}")
 
 
 def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now=None):
@@ -365,34 +349,63 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
     width = max(1, size.columns - 1)
     now = now or datetime.now(timezone.utc)
     subscriptions = subscriptions or {}
-    # Everything on a window line except the bar takes up to 71 cells.
-    bar_width = max(10, min(BAR_WIDTH, width - 71))
-    sections = [(title, group, age) for title, group, age in (
-        (f"{BOLD}{CYAN}CLAUDE{RESET}  {DIM}переключить: cswap switch <слот>{RESET}", claude, claude_age),
-        (f"{BOLD}{YELLOW}CODEX{RESET}", codex, codex_age),
-    ) if group]
-    accounts = [(acc, age) for _, group, age in sections for acc in group]
-    heads = [account_head(acc) for acc, _ in accounts]
-    subs = [f"{DIM}{subscription_text(subscriptions.get(acc['provider'] + ':' + acc['email'].casefold(), acc.get('subscription')), now)}{RESET}"
-            for acc, _ in accounts]
-    # Subscription dates share the account line in one column when every one fits.
-    column = max((visible(h) for h in heads), default=0) + 3
-    inline = all(column + visible(s) <= width for s in subs)
+    groups = [(title, group, age) for title, group, age in
+              (("CLAUDE", claude, claude_age), ("CODEX", codex, codex_age)) if group]
+    accounts = [(acc, age) for _, group, age in groups for acc in group]
+    domain = shared_domain([acc for acc, _ in accounts])
+    idents = [identity(acc, domain, subscriptions.get(acc["provider"] + ":" + acc["email"].casefold(),
+                                                     acc.get("subscription")), now)
+              for acc, _ in accounts]
+    windows = [w for acc, _ in accounts for w in acc["windows"]]
+
+    # Columns: slot | account | window label, percent, bar, time to reset | alert.
+    name_w = max((visible(row) for rows in idents for row in rows), default=0)
+    label_w = max((len(w["label"]) for w in windows), default=2)
+    reset_w = max((len(countdown(w.get("resets_at"), now)) for w in windows), default=0)
+    alert_w = max((visible(pace_alert(w, now)) for w in windows), default=0)
+    left_w = 5 + name_w + 3
+    fixed = left_w + label_w + 2 + 4 + 2 + 3 + reset_w + (3 + alert_w if alert_w else 0)
+    bar_w = max(10, min(BAR_WIDTH, width - fixed))
+    alerts_inline = fixed + bar_w <= width
+
     blocks = []
-    for (acc, age), head, sub in zip(accounts, heads, subs):
-        top = [head + " " * (column - visible(head)) + sub] if inline else [head, "      " + sub]
-        blocks.append(top + account_body(acc, age, bar_width, now))
+    for (acc, age), rows in zip(accounts, idents):
+        right = []
+        for w in acc["windows"]:
+            right.append(window_row(w, label_w, bar_w, reset_w, now))
+            alert = pace_alert(w, now)
+            if alert and alerts_inline:
+                right[-1] += "   " + alert
+            elif alert:
+                right.append(" " * (label_w + 8) + alert)
+        notice = notice_text(acc, age, now)
+        if notice:
+            right.append(f"{YELLOW}{notice}{RESET}")
+        slot = str(acc.get("slot") or "") if acc["provider"] == "claude" else ""
+        blocks.append([
+            (f"  {BOLD}{slot:<2}{RESET} " if i == 0 else " " * 5)
+            + pad(rows[i] if i < len(rows) else "", name_w) + "   " + (right[i] if i < len(right) else "")
+            for i in range(max(len(rows), len(right)))
+        ])
+
+    reset_end = left_w + label_w + 2 + 4 + 2 + bar_w + 3 + reset_w
+    def title_line(title):
+        line = f"  {BOLD}{title}{RESET}"
+        if not reset_w:
+            return line
+        return line + " " * max(2, reset_end - 11 - visible(line)) + f"{DIM}сброс через{RESET}"
 
     footer = [""] + [f"  {RED}{e}{RESET}" for e in errors] + [
-        f"{DIM}обновлено {now.astimezone():%H:%M:%S} · даты подписок: limits --help · выход Ctrl-C{RESET}"]
-    # Blank lines between accounts only when everything still fits on the screen.
-    spacious = (len(sections) + sum(map(len, blocks)) + len(footer)
-                + len(blocks) + len(sections) - 1 < size.lines)
+        f"  {DIM}переключить Claude: cswap switch <номер>   ·   "
+        f"обновлено {now.astimezone():%H:%M}   ·   выход Ctrl-C{RESET}"]
+    # A blank line before every account only when everything still fits on the screen.
+    tight = 2 * len(groups) - 1 + sum(map(len, blocks)) + len(footer)
+    spacious = tight + len(blocks) < size.lines
     lines, i = [], 0
-    for title, group, _ in sections:
-        if lines and spacious:
+    for title, group, _ in groups:
+        if lines:
             lines.append("")
-        lines.append(title)
+        lines.append(title_line(title))
         for block in blocks[i:i + len(group)]:
             if spacious:
                 lines.append("")
