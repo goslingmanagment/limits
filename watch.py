@@ -4,7 +4,7 @@
 Единый список cswap, CodexBar и профилей Codex из Orca.
 Даты подписок: данные входа Codex и отдельно подтверждённые даты Claude.
 
-  python3 watch.py            # живой экран, Ctrl-C выход
+  python3 watch.py            # живой экран: ↑↓ Enter — переключить Claude, r — обновить, q — выход
   python3 watch.py --once     # один кадр и выход (годится для скриптов)
 
 Частота опроса: Claude раз в 60 с, Codex раз в 300 с (его чтение дороже).
@@ -15,11 +15,15 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import termios
+import threading
 import time
+import tty
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -44,6 +48,13 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 ORANGE = "\033[38;5;214m"
 CYAN = "\033[36m"
+SELECT = "\033[48;5;237m"
+ACTIVE = "  ● активный"
+CODEX_DOWN = "CodexBar не отвечает (codexbar usage)"
+KEYS = {"\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+        "\r": "enter", "\n": "enter", "\x1b": "escape",
+        "r": "refresh", "R": "refresh", "к": "refresh", "К": "refresh",
+        "q": "quit", "Q": "quit", "й": "quit", "Й": "quit"}
 
 
 class FetchError(Exception):
@@ -52,7 +63,9 @@ class FetchError(Exception):
 
 def run(cmd, timeout=180, env=None):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        # No stdin: a child must never read the keys meant for the live screen.
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env,
+                           stdin=subprocess.DEVNULL)
         # CodexBar returns useful per-account JSON even on a partial failure.
         return p.stdout
     except (OSError, subprocess.TimeoutExpired):
@@ -264,6 +277,48 @@ def merge_last_good(old, fresh):
     return fresh
 
 
+def cache_path():
+    return Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser() / "limits/codex.json"
+
+
+def load_codex_cache():
+    """Codex accounts from the previous run, so the screen need not wait for CodexBar."""
+    try:
+        accounts = json.loads(cache_path().read_text()).get("accounts")
+    except (OSError, ValueError, AttributeError):
+        return None
+    def valid(acc):
+        return (isinstance(acc, dict) and acc.get("provider") == "codex" and isinstance(acc.get("email"), str)
+                and isinstance(acc.get("windows"), list)
+                and all(isinstance(w, dict) and isinstance(w.get("label"), str)
+                        and percentage(w.get("pct")) is not None for w in acc["windows"]))
+    return accounts if isinstance(accounts, list) and accounts and all(map(valid, accounts)) else None
+
+
+def save_codex_cache(accounts):
+    path = cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as stream:
+            json.dump({"accounts": accounts}, stream, ensure_ascii=False)
+        os.replace(stream.name, path)
+    except OSError:
+        pass
+
+
+def switch_account(slot):
+    out = run([binary(CSWAP, "cswap"), "switch", str(slot), "--json"], timeout=60)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        raise FetchError("cswap: " + str(data["error"].get("message") or "ошибка"))
+    if not isinstance(data, dict) or "switched" not in data:
+        raise FetchError("cswap switch не ответил")
+    return data
+
+
 def rolled(window, provider, now):
     """The window as it is now if its reset has already passed.
 
@@ -364,7 +419,7 @@ def identity(acc, domain, subscription, now):
     name = acc.get("label") or acc["email"]
     if domain:
         name = re.sub("@" + re.escape(domain), "", name, flags=re.IGNORECASE)
-    rows = [f"{BOLD}{name}{RESET}" + (f"  {CYAN}● активный{RESET}" if acc["active"] else "")]
+    rows = [f"{BOLD}{name}{RESET}" + (f"{CYAN}{ACTIVE}{RESET}" if acc["active"] else "")]
     plan = acc.get("plan") or ""
     if plan:
         rows.append(f"{DIM}{plan[0].upper() + plan[1:]}{RESET}")
@@ -382,7 +437,8 @@ def window_row(w, label_w, bar_w, reset_w, now):
             f"   {DIM}{countdown(w.get('resets_at'), now):>{reset_w}}{RESET}")
 
 
-def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now=None):
+def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now=None,
+           cursor=None, status="", interactive=False):
     size = shutil.get_terminal_size((120, 40))
     width = max(1, size.columns - 1)
     now = now or datetime.now(timezone.utc)
@@ -401,7 +457,10 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
               for acc, _ in accounts]
 
     # Columns: slot | account | window label, percent, bar, time to reset | alert.
-    name_w = max((visible(row) for rows in idents for row in rows), default=0)
+    # Room for the active badge on every Claude name keeps the table still after a switch.
+    name_w = max([visible(row) for rows in idents for row in rows]
+                 + [visible(rows[0]) + len(ACTIVE) * (not acc["active"])
+                    for (acc, _), rows in zip(accounts, idents) if acc["provider"] == "claude"], default=0)
     label_w = max((len(w["label"]) for w in windows), default=2)
     reset_w = max((len(countdown(w.get("resets_at"), now)) for w in windows), default=0)
     alert_w = max((visible(alert) for row in alerts for alert in row), default=0)
@@ -410,7 +469,7 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
     bar_w = max(10, min(BAR_WIDTH, width - fixed))
     alerts_inline = fixed + bar_w <= width
 
-    blocks = []
+    blocks, chosen = [], None
     for (acc, age), rows, account_alerts in zip(accounts, idents, alerts):
         right = []
         for w, alert in zip(acc["windows"], account_alerts):
@@ -423,11 +482,20 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
         if notice:
             right.append(f"{YELLOW}{notice}{RESET}")
         slot = str(acc.get("slot") or "") if acc["provider"] == "claude" else ""
+        if slot and acc.get("slot") == cursor:
+            chosen = len(blocks)
+        mark = "▶ " if chosen == len(blocks) else "  "
         blocks.append([
-            (f"  {BOLD}{slot:<2}{RESET} " if i == 0 else " " * 5)
+            (f"{BOLD}{mark}{slot:<2}{RESET} " if i == 0 else " " * 5)
             + pad(rows[i] if i < len(rows) else "", name_w) + "   " + (right[i] if i < len(right) else "")
             for i in range(max(len(rows), len(right)))
         ])
+
+    if chosen is not None:
+        # The selected account sits on a band as wide as the table.
+        table_w = max(visible(line) for block in blocks for line in block)
+        blocks[chosen] = [SELECT + line.replace(RESET, RESET + SELECT) + " " * (table_w - visible(line)) + RESET
+                          for line in blocks[chosen]]
 
     reset_end = left_w + label_w + 2 + 4 + 2 + bar_w + 3 + reset_w
     def title_line(title):
@@ -436,9 +504,10 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
             return line
         return line + " " * max(2, reset_end - 11 - visible(line)) + f"{DIM}сброс через{RESET}"
 
-    footer = [""] + [f"  {RED}{e}{RESET}" for e in errors] + [
-        f"  {DIM}переключить Claude: cswap switch <номер>   ·   "
-        f"обновлено {now.astimezone():%H:%M}   ·   выход Ctrl-C{RESET}"]
+    hint = ("↑↓ выбрать · Enter переключить · r обновить · q выход" if interactive
+            else "переключить Claude: cswap switch <номер>")
+    footer = [""] + [f"  {RED}{e}{RESET}" for e in errors] + ([f"  {status}"] if status else []) + [
+        f"  {DIM}{hint}   ·   обновлено {now.astimezone():%H:%M}{RESET}"]
     # A blank line before every account only when everything still fits on the screen.
     tight = 2 * len(groups) - 1 + sum(map(len, blocks)) + len(footer)
     spacious = tight + len(blocks) < size.lines
@@ -457,6 +526,10 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
     return "\n".join(clip_line(line, width) for line in lines + footer)
 
 
+def short_name(acc):
+    return acc["email"].split("@")[0]
+
+
 def tab_title(claude, now=None):
     active = next((a for a in claude or [] if a["active"] and a["windows"]), None)
     if not active:
@@ -464,7 +537,179 @@ def tab_title(claude, now=None):
     now = now or datetime.now(timezone.utc)
     top = max(w["pct"] for w in active["windows"])
     alarm = any(pace_alert(w, now) for w in active["windows"])
-    return f"limits · {active['email'].split('@')[0]} {top:.0f}%" + (" ▲" if alarm else "")
+    return f"limits · {short_name(active)} {top:.0f}%" + (" ▲" if alarm else "")
+
+
+def keys(data):
+    """Key names in one read from the terminal; digits stay digits, the rest is dropped."""
+    text, found = data.decode("utf-8", "ignore"), []
+    while text:
+        chunk = next((text[:size] for size in (3, 1) if text[:size] in KEYS), None)
+        if chunk:
+            found.append(KEYS[chunk])
+        elif text[0].isdigit():
+            found.append(text[0])
+        text = text[len(chunk or text[0]):]
+    return found
+
+
+def move(cursor, key, claude):
+    """The slot selected after an arrow, digit or Esc; None means nothing is selected."""
+    slots = [acc["slot"] for acc in claude or [] if acc.get("slot")]
+    if key == "escape" or not slots:
+        return None
+    if key.isdigit():
+        return int(key) if int(key) in slots else cursor
+    # The first arrow press steps away from the active account.
+    start = cursor if cursor in slots else next((a["slot"] for a in claude if a["active"] and a.get("slot")), None)
+    if start is None:
+        return slots[0]
+    step = slots.index(start) + (1 if key == "down" else -1)
+    return slots[max(0, min(len(slots) - 1, step))]
+
+
+def background(job):
+    """Run a job in a daemon thread: quitting never waits for a slow CLI."""
+    box = {}
+    def work():
+        try:
+            box["result"] = job()
+        except Exception as error:
+            box["error"] = error
+    box["thread"] = threading.Thread(target=work, daemon=True)
+    box["thread"].start()
+    return box
+
+
+def switch_note(result, error):
+    if error is not None:
+        return f"{RED}✗ {error}{RESET}"
+    to = result.get("to") or {}
+    if result.get("switched"):
+        return f"{GREEN}✓ Переключено на {to.get('number', '')} {str(to.get('email', '')).split('@')[0]}{RESET}"
+    return f"{DIM}{result.get('message') or 'без изменений'}{RESET}"
+
+
+def snapshot(args, subscriptions, color):
+    try:
+        claude, claude_error = fetch_claude(), ""
+    except FetchError as error:
+        claude, claude_error = None, str(error)
+    codex = fetch_codex()
+    if codex is not None:
+        save_codex_cache(codex)
+    errors = [message for message in (claude_error, "" if codex is not None else CODEX_DOWN) if message]
+    moment = datetime.now(timezone.utc)
+    claude, codex = roll_over(claude, moment), roll_over(codex, moment)
+    accounts = (claude or []) + (codex or [])
+    if args.json:
+        for acc in accounts:
+            acc["subscription"] = subscriptions.get(
+                acc["provider"] + ":" + acc["email"].casefold(), acc.get("subscription"))
+        print(json.dumps({"accounts": accounts, "errors": errors}, ensure_ascii=False, indent=2))
+    else:
+        frame = render(claude, codex, 0.0, 0.0, errors, subscriptions)
+        print(frame if color else ANSI.sub("", frame))
+    return 0 if any(a["windows"] for a in accounts) else 1
+
+
+def live(subscriptions, color):
+    """The live screen: sources refresh in the background, keys switch the Claude account."""
+    fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+    saved = termios.tcgetattr(fd) if fd is not None else None
+    if fd is not None:
+        tty.setcbreak(fd)
+    # Like any full-screen tool: own screen, no cursor; the shell's screen returns on exit.
+    sys.stdout.write("\033[?1049h\033[?25l")
+    try:
+        sources = {"claude": (fetch_claude, CLAUDE_EVERY), "codex": (fetch_codex, CODEX_EVERY)}
+        data = {"claude": None, "codex": load_codex_cache()}
+        fetched = {"claude": 0.0, "codex": 0.0}
+        failed = {"claude": "", "codex": ""}
+        jobs, cursor, note, note_until, refreshing = {}, None, "", 0.0, False
+        began, drawn_at, drawn_size = time.time(), 0.0, None
+        while True:
+            changed = False
+            for name, (fetch, every) in sources.items():
+                if name not in jobs and time.time() - fetched[name] >= every:
+                    jobs[name] = background(fetch)
+            for name in [name for name, job in jobs.items() if not job["thread"].is_alive()]:
+                job, changed = jobs.pop(name), True
+                result, error = job.get("result"), job.get("error")
+                if name == "switch":
+                    # Move the active marker now; asking cswap again at once confirms it.
+                    if result and result.get("switched"):
+                        slot = (result.get("to") or {}).get("number")
+                        data["claude"] = [dict(a, active=a.get("slot") == slot) for a in data["claude"] or []]
+                    cursor, fetched["claude"] = None, 0.0
+                    note, note_until = switch_note(result, error), time.time() + 8
+                    continue
+                fetched[name] = time.time()
+                if name == "claude":
+                    failed[name] = "" if error is None else str(error) if isinstance(error, FetchError) \
+                        else f"claude-swap: {error}"
+                else:
+                    failed[name] = "" if result is not None else f"CodexBar: {error}" if error else CODEX_DOWN
+                data[name] = merge_last_good(data[name], result)
+                if name == "codex" and result is not None:
+                    save_codex_cache(data["codex"])
+            refreshing = refreshing and ("claude" in jobs or "codex" in jobs)
+
+            ready = select.select([fd], [], [], 0.2)[0] if fd is not None else time.sleep(0.2)
+            pressed = os.read(fd, 64) if ready else None
+            if pressed == b"":
+                return 0  # the terminal is gone
+            for key in keys(pressed) if pressed else []:
+                changed = True
+                target = next((a for a in data["claude"] or [] if a.get("slot") == cursor), None)
+                if key == "quit":
+                    return 0
+                if key == "refresh":
+                    fetched, refreshing = dict.fromkeys(fetched, 0.0), True
+                elif key == "enter" and target and "switch" not in jobs:
+                    if target["active"]:
+                        cursor, note, note_until = None, f"{short_name(target)} уже активный", time.time() + 5
+                    else:
+                        jobs["switch"] = background(lambda slot=cursor: switch_account(slot))
+                        note, note_until = f"переключаю на {cursor} {short_name(target)}…", float("inf")
+                elif key != "enter":
+                    cursor = move(cursor, key, data["claude"])
+
+            size = shutil.get_terminal_size()
+            if data["claude"] is None and "claude" in jobs and time.time() - began < 1:
+                continue  # cswap answers in a moment; do not flash an empty screen
+            if not (changed or size != drawn_size or time.time() - drawn_at >= 10):
+                continue
+            target = next((a for a in data["claude"] or [] if a.get("slot") == cursor), None)
+            if target and "switch" not in jobs:
+                status = (f"{short_name(target)} уже активный · Esc — отмена" if target["active"] else
+                          f"Enter — переключиться на {cursor} {short_name(target)} · Esc — отмена")
+            elif note and time.time() < note_until:
+                status = note
+            elif refreshing:
+                status = f"{DIM}обновляю…{RESET}"
+            elif data["codex"] is None and "codex" in jobs:
+                status = f"{DIM}Codex: загрузка…{RESET}"
+            else:
+                status = ""
+            moment = datetime.now(timezone.utc)
+            claude, codex = roll_over(data["claude"], moment), roll_over(data["codex"], moment)
+            ages = {name: time.time() - fetched[name] if fetched[name] else None for name in fetched}
+            frame = render(claude, codex, ages["claude"], ages["codex"], [m for m in failed.values() if m],
+                           subscriptions, cursor=cursor, status=status, interactive=fd is not None)
+            if not color:
+                frame = ANSI.sub("", frame)
+            # Overwrite in place inside a synchronized update instead of clearing: no flicker.
+            body = "\n".join(line + "\033[K" for line in frame.split("\n"))
+            sys.stdout.write(f"\033]2;{tab_title(claude)}\007\033[?2026h\033[H{body}\033[J\033[?2026l")
+            sys.stdout.flush()
+            drawn_at, drawn_size = time.time(), size
+    finally:
+        if fd is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        # An empty title hands the tab back to the shell's own title.
+        sys.stdout.write("\033[?25h\033[?1049l\033]2;\007")
+        sys.stdout.flush()
 
 
 def main():
@@ -488,53 +733,9 @@ def main():
         return 2
     once = args.once or args.json or not sys.stdout.isatty()
     color = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
-    claude = codex = None
-    claude_at = codex_at = 0.0
-    failed = {"claude": "", "codex": ""}
-
     try:
-        while True:
-            now = time.time()
-            if not claude_at or now - claude_at >= CLAUDE_EVERY:
-                try:
-                    fresh, failed["claude"] = fetch_claude(), ""
-                except FetchError as error:
-                    fresh, failed["claude"] = None, str(error)
-                claude, claude_at = merge_last_good(claude, fresh), time.time()
-            if not codex_at or now - codex_at >= CODEX_EVERY:
-                fresh = fetch_codex()
-                failed["codex"] = "" if fresh is not None else "CodexBar не отвечает (codexbar usage)"
-                codex, codex_at = merge_last_good(codex, fresh), time.time()
-            errors = [message for message in failed.values() if message]
-            # Cached usage can outlive its window; show every window as it is now.
-            moment = datetime.now(timezone.utc)
-            shown_claude, shown_codex = roll_over(claude, moment), roll_over(codex, moment)
-            if args.json:
-                accounts = (shown_claude or []) + (shown_codex or [])
-                for acc in accounts:
-                    acc["subscription"] = subscriptions.get(
-                        acc["provider"] + ":" + acc["email"].casefold(), acc.get("subscription"))
-                print(json.dumps({"accounts": accounts, "errors": errors}, ensure_ascii=False, indent=2))
-                return 0 if any(a["windows"] for a in accounts) else 1
-            frame = render(
-                shown_claude,
-                shown_codex,
-                time.time() - claude_at if claude else None,
-                time.time() - codex_at if codex else None,
-                errors,
-                subscriptions,
-            )
-            if not color:
-                frame = ANSI.sub("", frame)
-            if once:
-                print(frame)
-                return 0 if any(a["windows"] for a in (claude or []) + (codex or [])) else 1
-            sys.stdout.write(f"\033]2;{tab_title(shown_claude)}\007\033[H\033[2J" + frame + "\n")
-            sys.stdout.flush()
-            time.sleep(10)
+        return snapshot(args, subscriptions, color) if once else live(subscriptions, color)
     except KeyboardInterrupt:
-        # An empty title hands the tab back to the shell's own title.
-        sys.stdout.write("\n" if once else "\033]2;\007\n")
         return 0
 
 

@@ -312,5 +312,74 @@ class Display(unittest.TestCase):
         self.assertEqual(watch.notice_text(account(20), None, now), "данные 20m назад")
 
 
+
+class Live(unittest.TestCase):
+    CLAUDE = [dict(provider="claude", email=f"{name}@example.com", slot=slot, active=slot == 2,
+                   windows=[{"pct": 10 * slot, "label": "7d"}])
+              for slot, name in ((1, "alice"), (2, "carol"), (3, "dave"))]
+
+    def test_keys_are_read_in_both_layouts(self):
+        self.assertEqual(watch.keys(b"\x1b[A\x1bOB3\rx"), ["up", "down", "3", "enter"])
+        self.assertEqual(watch.keys("кй".encode()), ["refresh", "quit"])
+        self.assertEqual(watch.keys(b"\x1b"), ["escape"])
+
+    def test_selection_starts_next_to_the_active_account(self):
+        move = watch.move
+        self.assertEqual(move(None, "down", self.CLAUDE), 3)
+        self.assertEqual(move(None, "up", self.CLAUDE), 1)
+        self.assertEqual(move(3, "down", self.CLAUDE), 3)
+        self.assertEqual(move(None, "1", self.CLAUDE), 1)
+        self.assertEqual(move(1, "7", self.CLAUDE), 1)
+        self.assertIsNone(move(3, "escape", self.CLAUDE))
+        self.assertIsNone(move(None, "down", None))
+
+    def test_selected_account_is_marked_and_hinted(self):
+        with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((100, 40))):
+            text = watch.render(self.CLAUDE, [], 0, 0, [], cursor=3, status="Enter — переключиться на 3 dave",
+                                interactive=True)
+        lines = watch.ANSI.sub("", text).splitlines()
+        self.assertTrue(next(l for l in lines if "dave" in l).startswith("▶ 3  dave"))
+        self.assertTrue(next(l for l in lines if "alice" in l).startswith("  1  alice"))
+        self.assertIn(watch.SELECT, next(l for l in text.splitlines() if "dave" in l))
+        self.assertIn("Enter — переключиться на 3 dave", text)
+        self.assertIn("↑↓ выбрать", lines[-1])
+        with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((100, 40))):
+            self.assertIn("cswap switch <номер>", watch.ANSI.sub("", watch.render(self.CLAUDE, [], 0, 0, [])))
+
+    def test_codex_cache_roundtrip_is_private_and_rejects_junk(self):
+        acc = dict(provider="codex", email="bob@example.com", windows=[{"label": "7d", "pct": 40.0}])
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"XDG_CACHE_HOME": tmp}):
+            self.assertIsNone(watch.load_codex_cache())
+            watch.save_codex_cache([acc])
+            self.assertEqual(watch.load_codex_cache(), [acc])
+            self.assertEqual(os.stat(watch.cache_path()).st_mode & 0o777, 0o600)
+            for junk in ("broken", "[]", json.dumps({"accounts": [{"provider": "claude"}]})):
+                watch.cache_path().write_text(junk)
+                self.assertIsNone(watch.load_codex_cache())
+
+    def test_switch_goes_through_cswap_json(self):
+        calls = []
+        def answer(out):
+            def fake(cmd, timeout=180, env=None):
+                calls.append(cmd)
+                return out
+            return fake
+        ok = {"switched": True, "to": {"number": 3, "email": "dave@example.com"}}
+        with patch.object(watch, "run", side_effect=answer(json.dumps(ok))):
+            self.assertEqual(watch.switch_account(3), ok)
+        self.assertEqual(calls[0][1:], ["switch", "3", "--json"])
+        self.assertIn("Переключено на 3 dave", watch.switch_note(ok, None))
+        envelope = {"error": {"message": "Account 9 not found"}}
+        for out, message in ((json.dumps(envelope), "cswap: Account 9 not found"), ("", "cswap switch не ответил")):
+            with patch.object(watch, "run", side_effect=answer(out)), self.assertRaises(watch.FetchError) as caught:
+                watch.switch_account(9)
+            self.assertEqual(str(caught.exception), message)
+
+    def test_children_never_read_the_terminal(self):
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as spawned:
+            watch.run(["test"])
+        self.assertIs(spawned.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+
 if __name__ == "__main__":
     unittest.main()
