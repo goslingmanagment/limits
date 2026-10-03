@@ -314,16 +314,25 @@ class Display(unittest.TestCase):
 
 
 
-def reply(at, model="claude-opus-5-5", session="cli", output=100, cache_read=0, msg="m1", desktop=False):
-    """One transcript line of an assistant reply, as Claude Code writes it."""
+def reply(at, model="claude-opus-5-5", session="cli", output=100, cache_read=0, msg="m1", desktop=False,
+          stop="end_turn", speed="standard"):
+    """One transcript line of an assistant reply, as Claude Code writes it; stop=None is a copy mid-stream."""
+    usage = {"input_tokens": 1000, "output_tokens": output, "cache_read_input_tokens": cache_read,
+             "cache_creation_input_tokens": 0,
+             "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0}}
+    if stop:
+        usage["speed"] = speed
     return json.dumps({
         "type": "assistant", "timestamp": at.isoformat().replace("+00:00", "Z"), "requestId": "r-" + msg,
         "sessionId": session, "entrypoint": "claude-desktop" if desktop else "cli", "uuid": "u-" + msg,
-        "message": {"id": msg, "model": model, "usage": {
-            "input_tokens": 1000, "output_tokens": output, "cache_read_input_tokens": cache_read,
-            "cache_creation_input_tokens": 0,
-            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0}}},
+        "message": {"id": msg, "model": model, "stop_reason": stop, "usage": usage},
     }) + "\n"
+
+
+def spent_in(usd, tokens=None, models=None, start=0.0):
+    """A window's spend as worth.window_spend returns it."""
+    return {"start": start, "until": start, "usd": usd, "tokens": tokens or dict.fromkeys(worth.TOKENS, 0),
+            "models": models or {}, "unattributed_usd": 0.0, "unrecorded_desktop_usd": 0.0, "estimated_output": 0}
 
 
 def log_line(at, text):
@@ -338,11 +347,12 @@ class Cost(unittest.TestCase):
             root, at = Path(tmp) / "projects", self.NOW - timedelta(hours=1)
             root.mkdir()
             transcript = root / "s.jsonl"
-            done = reply(at, output=8) + reply(at, output=120) + "{broken\n"
+            done = reply(at, output=8, stop=None) + reply(at, output=120, speed="fast") + "{broken\n"
             transcript.write_text(done + reply(at, msg="m2")[:40])
             db = worth.open_index(Path(tmp) / "index.sqlite3")
             worth.update_index(db, root, self.NOW.timestamp())
-            self.assertEqual(db.execute("SELECT key, output FROM replies").fetchall(), [("m1:r-m1", 120)])
+            self.assertEqual(db.execute("SELECT key, output, fast, final FROM replies").fetchall(),
+                             [("m1:r-m1", 120, 1, 1)])
             self.assertEqual(db.execute("SELECT offset FROM files").fetchone()[0], len(done.encode()))
             transcript.write_text(done + reply(at, msg="m2"))
             worth.update_index(db, root, self.NOW.timestamp())
@@ -350,6 +360,10 @@ class Cost(unittest.TestCase):
             transcript.write_text(reply(at, msg="m3"))  # rewritten shorter: read from the start
             worth.update_index(db, root, self.NOW.timestamp())
             self.assertEqual(db.execute("SELECT count(*) FROM replies").fetchone()[0], 3)
+            (root / "new").write_text(reply(at, msg="m4"))  # replaced by a file of the same size
+            os.replace(root / "new", transcript)
+            worth.update_index(db, root, self.NOW.timestamp())
+            self.assertEqual(db.execute("SELECT count(*) FROM replies").fetchone()[0], 4)
             old = (self.NOW + timedelta(days=9)).timestamp()
             worth.update_index(db, root, old)
             self.assertEqual(db.execute("SELECT count(*) FROM replies").fetchone()[0], 0)
@@ -359,12 +373,12 @@ class Cost(unittest.TestCase):
         million = 1_000_000
         self.assertEqual(worth.price("claude-opus-5-5", (million, million, million, 0, 0)), 4 + 20 + 0.2)
         self.assertEqual(worth.price("claude-fable-5-1", (0, 0, million, million, million)), 0.25 + 12.5 + 20)
-        self.assertEqual(worth.price("claude-sonnet-5-5", (million, 0, 0, 0, 0), fast=True), 4)
+        self.assertEqual(worth.price("claude-sonnet-5-5", (million, 0, 0, 0, 0)), 2)
         self.assertEqual(worth.price("claude-opus-6", (million, 0, 0, 0, 0)), 4)
         self.assertEqual(worth.price("<synthetic>", (million, 0, 0, 0, 0)), 0)
 
     def test_cswap_log_follows_slots_and_unknown_credentials(self):
-        t = [self.NOW + timedelta(minutes=i) for i in range(8)]
+        t = [self.NOW + timedelta(minutes=i) for i in range(11)]
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "claude-swap.log.1").write_text(
                 log_line(t[0], "Added account 1: a@example.com (org: org-a)")
@@ -375,11 +389,15 @@ class Cost(unittest.TestCase):
                 + log_line(t[4], "Switched from account 1 to 2")
                 + log_line(t[5], "Live credential resolves to a different account than Account-2's identity; backup left")
                 + log_line(t[6], "Moved slot: 2 (a@example.com) -> 5")
-                + log_line(t[7], "Resynced account 5's backup to the rotated live credential"))
+                + log_line(t[7], "Resynced account 5's backup to the rotated live credential")
+                + log_line(t[9], "Live credential does not belong to Account-5 (foreign): stashed as x "
+                                 f"(credentials mtime {t[8].isoformat().replace('+00:00', 'Z')}). Something outside")
+                + log_line(t[10], "Activated account 1 (no prior live account)"))
             history = worth.account_history(tmp)
         self.assertEqual(history, [(t[0].timestamp(), "a@example.com"), (t[2].timestamp(), "b@example.com"),
                                    (t[4].timestamp(), "a@example.com"), (t[5].timestamp(), None),
-                                   (t[7].timestamp(), "a@example.com")])
+                                   (t[7].timestamp(), "a@example.com"), (t[8].timestamp(), None),
+                                   (t[10].timestamp(), "b@example.com")])
 
     def test_usage_goes_to_the_account_it_ran_as(self):
         now = self.NOW
@@ -388,8 +406,8 @@ class Cost(unittest.TestCase):
             dict(provider="claude", email="a@example.com", org="org-a", windows=[
                 {"label": "7d", "pct": 50.0, "resets_at": (now + timedelta(days=6)).isoformat()},
                 {"label": "Fable", "scope": "Fable", "pct": 10.0, "resets_at": (now + timedelta(days=6)).isoformat()}]),
-            dict(provider="claude", email="b@example.com", org="org-b", windows=[
-                {"label": "5h", "pct": 20.0, "resets_at": (now + 4 * hour).isoformat()}]),
+            dict(provider="claude", email="b@example.com", org="org-b", fetched_at=(now - hour / 6).isoformat(),
+                 windows=[{"label": "5h", "pct": 20.0, "resets_at": (now + 4 * hour).isoformat()}]),
         ]
         with tempfile.TemporaryDirectory() as tmp, patch("pathlib.Path.home", return_value=Path(tmp)), \
                 patch.dict(os.environ, {"XDG_CACHE_HOME": tmp + "/cache"}), patch.dict(os.environ) as env:
@@ -408,24 +426,28 @@ class Cost(unittest.TestCase):
                 reply(now - 20 * hour, msg="before")                    # no account known yet
                 + reply(now - 5 * hour, msg="a1")                       # CLI as a
                 + reply(now - 5 * hour, model="claude-fable-5-1", output=0, msg="a2")
+                + reply(now - 5 * hour, output=8, stop=None, msg="a3")  # never ended in the file: output guessed
+                + reply(now - 5 * hour, msg="f1", speed="fast")         # fast mode: usage credits, not limits
                 + reply(now - hour / 2, msg="b1")                       # CLI as b, inside b's 5h window
                 + reply(now - hour / 2, session="desk", desktop=True, msg="d1")    # Desktop session of a
-                + reply(now - hour / 2, session="child", desktop=True, msg="c1"))  # launched from Desktop: as b
+                + reply(now - hour / 2, session="child", desktop=True, msg="c1")   # launched from Desktop: as b
+                + reply(now - hour / 12, msg="b2"))                     # after b's percentage was read
             spend = worth.window_spend(accounts, now.timestamp())
         week, fable, five = spend[("a@example.com", "7d")], spend[("a@example.com", "Fable")], spend[("b@example.com", "5h")]
         opus = worth.price("claude-opus-5-5", (1000, 100, 0, 0, 0))
-        self.assertAlmostEqual(week["usd"], 2 * opus + worth.price("claude-fable-5-1", (1000, 0, 0, 0, 0)))
+        self.assertAlmostEqual(week["usd"], 3 * opus + worth.price("claude-fable-5-1", (1000, 0, 0, 0, 0)))
         self.assertAlmostEqual(week["unattributed_usd"], opus)
-        self.assertEqual(week["tokens"], {"input": 3000, "output": 200, "cache_read": 0, "cache_write": 0})
+        self.assertEqual(week["tokens"], {"input": 4000, "output": 300, "cache_read": 0, "cache_write": 0})
+        self.assertEqual(week["estimated_output"], 92)
         self.assertEqual(fable["tokens"]["input"], 1000)
         self.assertAlmostEqual(five["usd"], 2 * opus)
+        self.assertAlmostEqual(five["unrecorded_desktop_usd"], opus)
         self.assertIs(worth.lookup(spend, "b@example.com", accounts[1]["windows"][0]), five)
         restarted = dict(accounts[1]["windows"][0], resets_at=(now + 5 * hour).isoformat())
         self.assertIsNone(worth.lookup(spend, "b@example.com", restarted))
 
     def test_estimate_needs_a_percent_and_local_spend(self):
-        spent = {"usd": 50.0, "tokens": {"input": 1, "output": 2, "cache_read": 997, "cache_write": 0},
-                 "models": {}, "unattributed_usd": 0.0}
+        spent = spent_in(50.0, {"input": 1, "output": 2, "cache_read": 997, "cache_write": 0})
         self.assertEqual(worth.estimate(spent, 25), {"usd": 2.0, "tokens": 40.0, "rough": False})
         self.assertTrue(worth.estimate(spent, 5)["rough"])
         self.assertIsNone(worth.estimate(spent, 0))
@@ -438,10 +460,10 @@ class Cost(unittest.TestCase):
         claude = [dict(provider="claude", email="alice@example.com", slot=1, active=True, windows=windows)]
         codex = [dict(provider="codex", email="bob@example.com", active=False,
                       windows=[{"label": "7d", "pct": 20.0, "resets_at": reset}])]
-        spent = {"usd": 2045.0, "tokens": {"input": 0, "output": 16_000_000, "cache_read": 5_200_000_000,
-                                           "cache_write": 95_000_000}, "unattributed_usd": 0.0,
-                 "models": {"claude-opus-5-5": {"usd": 1800.0}, "claude-fable-5-1": {"usd": 240.0},
-                            "claude-haiku-4-5-20251001": {"usd": 5.0}}}
+        spent = spent_in(2045.0, {"input": 0, "output": 16_000_000, "cache_read": 5_200_000_000,
+                                  "cache_write": 95_000_000},
+                         {"claude-opus-5-5": {"usd": 1800.0}, "claude-fable-5-1": {"usd": 240.0},
+                          "claude-haiku-4-5-20251001": {"usd": 5.0}})
         spend = {("alice@example.com", label): dict(spent, start=worth.window_start(w))
                  for label, w in (("7d", windows[0]), ("5h", windows[1]))}
         with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((120, 40))):
@@ -476,29 +498,36 @@ class Cost(unittest.TestCase):
         five = {"label": "5h", "pct": 40.0, "resets_at": (now + timedelta(hours=2)).isoformat()}
         account = dict(provider="claude", email="a@example.com", plan="Max 20x", windows=[week, five])
         def spend(usd):
-            spent = {"usd": usd, "tokens": dict.fromkeys(worth.TOKENS, 10 ** 6), "unattributed_usd": 0.0,
-                     "models": {"claude-opus-5-5": {"usd": usd, "tokens": dict.fromkeys(worth.TOKENS, 10 ** 6)}}}
-            return {("a@example.com", w["label"]): dict(spent, start=worth.window_start(w)) for w in (week, five)}
+            tokens = dict.fromkeys(worth.TOKENS, 10 ** 6)
+            return {("a@example.com", w["label"]): spent_in(usd, tokens, {"claude-opus-5-5": {"usd": usd, "tokens": tokens}},
+                                                            worth.window_start(w)) for w in (week, five)}
+        def record(usd):
+            return worth.record_history([account], spend(usd), now.timestamp())
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"XDG_DATA_HOME": tmp}):
-            self.assertEqual(worth.record_history([account], spend(400.0), now.timestamp()), 2)
-            self.assertEqual(worth.record_history([account], spend(401.0), now.timestamp()), 0)
+            worth._seen.clear()
+            self.assertEqual(record(400.0), 2)
+            worth._seen.clear()  # a new process reads where the file left off, first line included
+            self.assertEqual(record(401.0), 0)
             week["pct"], five["pct"] = 41.0, 44.0  # a weekly point counts, the 5-hour window waits for 5
-            self.assertEqual(worth.record_history([account], spend(410.0), now.timestamp()), 1)
-            worth._written.clear()  # a new process reads where the file left off
-            week["resets_at"] = (now + timedelta(days=2)).isoformat()
-            self.assertEqual(worth.record_history([account], spend(410.0), now.timestamp()), 0)
-            five["pct"] = 100.0
-            self.assertEqual(worth.record_history([account], spend(1000.0), now.timestamp()), 1)
+            self.assertEqual(record(410.0), 1)
+            week["resets_at"] = (now + timedelta(days=2)).isoformat()  # the same window read a second later
             path = worth.history_path()
+            with open(path, "a") as other:  # another limits process got there first
+                other.write(json.dumps(dict(json.loads(path.read_text().splitlines()[-1]), pct=42.0)) + "\n")
+            week["pct"] = 42.0
+            self.assertEqual(record(420.0), 0)
+            five["pct"] = 100.0
+            self.assertEqual(record(1000.0), 1)
+            self.assertEqual(record(1001.0), 0)  # an exhausted window is written once
             self.assertEqual(path, Path(tmp) / "limits/history.jsonl")
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             final = worth.load_history()
-        self.assertEqual([(e["window"], e["pct"], e["spent_usd"]) for e in final], [("5h", 100.0, 1000.0), ("7d", 41.0, 410.0)])
-        self.assertEqual(final[1]["per_percent"]["usd"], 10.0)
+        self.assertEqual([(e["window"], e["pct"], e["spent_usd"]) for e in final], [("5h", 100.0, 1000.0), ("7d", 42.0, 410.0)])
+        self.assertEqual(final[1]["per_percent"]["usd"], 10.0)  # the other process's line
         self.assertEqual(final[1]["models"]["claude-opus-5-5"]["usd"], 410.0)
         report = watch.ANSI.sub("", watch.history_report(final, now))
         self.assertLess(report.index("7d · Max 20x"), report.index("5h · Max 20x"))
-        self.assertRegex(report, r"идёт   a +41%   \$10\.0 · 98K   \$1,000 · 9\.8M   Opus 5\.5")
+        self.assertRegex(report, r"идёт   a +42%   \$10\.0 · 98K   \$1,000 · 9\.8M   Opus 5\.5")
         self.assertIn("история пуста", watch.history_report([], now))
 
     def test_amounts_are_short(self):

@@ -592,8 +592,7 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
 
     hint = (f"↑↓ выбрать · Enter переключить · c {'лимиты' if cost else 'стоимость'} · r обновить · q выход"
             if interactive else "переключить Claude: cswap switch <номер>")
-    legend = [f"  {DIM}цена по API и токены вместе с кэшем; считается расход на этом Mac — "
-              f"claude.ai и телефон не видны · ~ окно < 10%{RESET}"] if cost else []
+    legend = [f"  {DIM}цена API и токены с кэшем · только расход на этом Mac · ~ окно < 10%{RESET}"] if cost else []
     footer = [""] + [f"  {RED}{e}{RESET}" for e in errors] + ([f"  {status}"] if status else []) + legend + [
         f"  {DIM}{hint}   ·   обновлено {now.astimezone():%H:%M}{RESET}"]
     # A blank line before every account only when everything still fits on the screen.
@@ -690,15 +689,15 @@ def history_report(entries, now=None):
     now = now or datetime.now(timezone.utc)
     groups = {}
     for entry in entries:
-        if entry.get("per_percent"):
+        # Short windows pile up; the ones measured past rounding say enough.
+        if entry.get("per_percent") and not (entry["window"] == "5h" and entry.get("rough")):
             groups.setdefault((entry["window"] != "7d", entry["window"] == "5h", entry["window"],
                                entry.get("plan") or ""), []).append(entry)
     if not groups:
         return "  история пуста: она пишется, пока открыт limits или вызывается limits --cost"
     lines = []
     for (_, five, label, plan), group in sorted(groups.items()):
-        # Short windows pile up; the latest dozen measured past rounding say enough.
-        group = [e for e in group if not e.get("rough")][-12:] if five else group
+        group = group[-12:] if five else group
         rows = []
         for e in group:
             resets = parse_date(e["resets_at"])
@@ -737,7 +736,7 @@ def snapshot(args, subscriptions, color):
         try:
             spend = measure(claude)
         except (OSError, sqlite3.Error) as error:
-            errors.append(f"расход не посчитан: {error}")
+            errors.append(f"расход и история не обновлены: {error}")
     if args.json:
         for acc in accounts:
             acc["subscription"] = subscriptions.get(
@@ -789,7 +788,7 @@ def live(subscriptions, color, cost=False):
                     continue
                 if name == "spend":
                     spent_at, spend = time.time(), spend if error else result
-                    failed[name] = f"расход не посчитан: {error}" if error else ""
+                    failed[name] = f"расход и история не обновлены: {error}" if error else ""
                     continue
                 fetched[name] = time.time()
                 if name == "claude":
@@ -846,8 +845,7 @@ def live(subscriptions, color, cost=False):
             moment = datetime.now(timezone.utc)
             claude, codex = roll_over(data["claude"], moment), roll_over(data["codex"], moment)
             ages = {name: time.time() - fetched[name] if fetched[name] else None for name in fetched}
-            errors = [m for name, m in failed.items() if m and (cost or name != "spend")]
-            frame = render(claude, codex, ages["claude"], ages["codex"], errors,
+            frame = render(claude, codex, ages["claude"], ages["codex"], [m for m in failed.values() if m],
                            subscriptions, cursor=cursor, status=status, interactive=fd is not None,
                            cost=cost, spend=spend)
             if not color:
