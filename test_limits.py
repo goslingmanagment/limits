@@ -512,6 +512,16 @@ class Statistics(unittest.TestCase):
         self.assertEqual(result["data"]["checks"]["matched"], 2)
         self.assertEqual([round(r["at"]) for r in result["data"]["restarts"]], [round((now - 10 * hour).timestamp())])
 
+    def test_a_segment_takes_the_plan_seen_in_it(self):
+        plans = [(100.0, "Max 5x"), (480.0, "Max 5x"), (500.0, "Max 20x")]
+        self.assertEqual(worth.plan_for(plans, 0, 400), "Max 5x")
+        # After a switch the live profile is the stale copy for a few minutes; a plan seen
+        # after the segment's last reading still belongs to it.
+        self.assertEqual(worth.plan_for(plans, 450, 900), "Max 20x")
+        self.assertEqual(worth.plan_for(plans, 600, 900), "Max 20x")
+        self.assertEqual(worth.plan_for(plans, 0, 50), "Max 5x?")
+        self.assertEqual(worth.plan_for([], 0, 50), "")
+
     def test_readings_measure_by_level_or_by_their_difference(self):
         now, hour = self.NOW, timedelta(hours=1)
         week = now + timedelta(days=4)

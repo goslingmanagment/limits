@@ -572,9 +572,9 @@ def spent(db, owner, start, until, scope=""):
     return total
 
 
-def plan_for(plans, start, until):
+def plan_for(plans, start, end):
     """The plan in force in a segment: seen inside it, else the last seen before, else the first after."""
-    inside = [plan for at, plan in plans if start <= at <= until]
+    inside = [plan for at, plan in plans if start <= at < end]
     before = [plan for at, plan in plans if at < start]
     # Right after a switch the live profile is still the saved copy, so the latest sighting counts.
     return inside[-1] if inside else before[-1] if before else plans[0][1] + "?" if plans else ""
@@ -713,7 +713,8 @@ def measure(accounts, now=None):
                 row = {
                     "email": email, "window": label, "resets_at": end, "segment": n + 1, "of": len(bounds),
                     "from": t0, "from_kind": kind, "until": until, "pct": pct, "points": points, "method": method,
-                    "plan": plan_for(plans.get(email, []), t0, until), "current": end > now and n + 1 == len(bounds),
+                    # The plan may be seen after the last reading: the segment runs on to its end.
+                    "plan": plan_for(plans.get(email, []), t0, t1), "current": end > now and n + 1 == len(bounds),
                     "spent": total, "nobody_usd": nobody, "flags": flags, "full": None,
                 }
                 if points >= 1 and total["usd"] > 0:
