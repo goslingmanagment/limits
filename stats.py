@@ -179,6 +179,8 @@ def data_tab(result):
                      f"по {clock(indexed['to'])}".replace(",", " "))
     if d["log_from"]:
         lines.append(f"  журнал cswap с {clock(d['log_from'], True)}: расход до этого ни к кому не отнесён и в таблицы не входит")
+    lines.append("  закрытые окна записаны в windows.jsonl и остаются в таблицах; "
+                 f"старше индекса сейчас: {d.get('archived', 0)}")
     usd = d["usd"]
     lines += ["", f"  {BOLD}Расход с начала журнала: {money(usd)}{RESET}",
               f"  выход оценён по содержимому ответа: {share(d['usd_guessed'], usd)}",

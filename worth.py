@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 import time
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,7 @@ RESUMED_USD, RESUMED_SHARE = 20.0, 0.1
 OPENED_LATE = 660  # a 5h window opens with its first request, rounded down to ten minutes
 MIN_BASELINE = 20  # points between two readings before their difference is trusted
 FIT_DAYS, FIT_MIN, FIT_R2 = 30, 500, 0.9
+METHOD = 1  # goes up when kept results would come out differently, so older ones can be told apart
 
 # $ per million tokens: input, output, cache read, 5-minute and 1-hour cache writes
 # (API prices of 2026-09-25). The first matching name wins; an unknown model has no price.
@@ -580,6 +582,42 @@ def plan_for(plans, start, end):
     return inside[-1] if inside else before[-1] if before else plans[0][1] + "?" if plans else ""
 
 
+def windows_path():
+    return data_dir() / "windows.jsonl"
+
+
+def keep_closed(rows, now, horizon):
+    """The measured rows plus those kept of windows the index no longer reaches; closed ones are saved.
+
+    The index holds 90 days. A window is measured anew while all of it lies within the
+    index and remembered afterwards: windows.jsonl has every closed segment as it was
+    last measured, so the weeks stay in the tables for good.
+    """
+    def key(row):
+        return row["email"], row["window"], row["resets_at"], row["segment"]
+    path, measured, old = windows_path(), {key(row) for row in rows}, []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+            if row["resets_at"] - SPAN.get(row["window"], WEEK) < horizon and key(row) not in measured:
+                flags = row["flags"] + ["прежний метод"] * (row.get("v") != METHOD and "прежний метод" not in row["flags"])
+                old.append(dict(row, archived=True, current=False, flags=flags))
+        except (ValueError, KeyError, TypeError):
+            continue
+    closed = [dict(row, v=METHOD) for row in rows if row["resets_at"] < now and row["full"]]
+    if closed or old:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as stream:
+            for row in old + closed:
+                stream.write(json.dumps({k: v for k, v in row.items() if k != "archived"}, ensure_ascii=False) + "\n")
+        os.replace(stream.name, path)
+    return sorted(old + rows, key=lambda row: (row["resets_at"], row["email"], row["window"], row["segment"]))
+
+
 def measure(accounts, now=None):
     """Every segment of every Claude window that can be measured, and what the numbers rest on.
 
@@ -647,6 +685,7 @@ def measure(accounts, now=None):
         # that went on in earnest after the limit had been hit and before its reset. Requests
         # already under way finish after a hit; such tails are small and end in more hits.
         log_from = moments[0] if moments else now
+        horizon = max(log_from, now - KEEP)  # earlier windows are not all in the index or have no owner
         restarts, dropped = {}, []
         for (email, label, end), seen in windows.items():
             scope = "" if label in ("5h", "7d") else label.casefold()
@@ -680,8 +719,8 @@ def measure(accounts, now=None):
         for (email, label, end), seen in sorted(windows.items(), key=lambda item: (item[0][2], item[0][0], item[0][1])):
             scope = "" if label in ("5h", "7d") else label.casefold()
             start = end - SPAN.get(label, WEEK)
-            if start < log_from:
-                continue  # nothing tells whose usage it was before cswap's log begins
+            if start < horizon:
+                continue  # before cswap's log nothing tells whose usage it was; older windows are kept, not measured
             # A restart of one window restarts them all, so every window of the account splits there.
             bounds = [(start, "reset")] + sorted((at, "restart") for at in restarts.get(email, [])
                                                  if start + 900 < at < end)
@@ -728,6 +767,8 @@ def measure(accounts, now=None):
                     }
                 rows.append(row)
 
+        rows = keep_closed(rows, now, horizon)
+
         # Shares of what is uncertain, over the time the accounts are known for.
         totals = db.execute("SELECT SUM(usd), SUM(usd_guessed), SUM(usd * alone), SUM(usd * edge), "
                             "SUM(CASE WHEN owner IS NULL THEN usd ELSE 0 END) FROM spend WHERE ts >= ?", (log_from,)).fetchone()
@@ -746,6 +787,7 @@ def measure(accounts, now=None):
             "restarts": sorted(({"email": email, "at": at} for email, times in restarts.items() for at in times
                                 if at >= log_from), key=lambda restart: restart["at"]),
             "plans": plans, "coverage": {day: len(hours) for day, hours in sorted(days.items())},
+            "archived": sum(1 for row in rows if row.get("archived")),
         }
     finally:
         db.close()

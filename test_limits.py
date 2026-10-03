@@ -512,6 +512,27 @@ class Statistics(unittest.TestCase):
         self.assertEqual(result["data"]["checks"]["matched"], 2)
         self.assertEqual([round(r["at"]) for r in result["data"]["restarts"]], [round((now - 10 * hour).timestamp())])
 
+    def test_closed_windows_stay_after_the_index_has_moved_on(self):
+        now, hour = self.NOW, timedelta(hours=1)
+        with contextlib.ExitStack() as stack:
+            home = self.home(stack)
+            (home / ".claude-swap-backup/claude-swap.log").write_text(
+                log_line(now - 100 * hour, "Added account 1: a@example.com (org: org-a)"))
+            (home / ".claude/projects/p/t.jsonl").write_text(
+                reply(now - 50 * hour, output=10 * MILLION)
+                + hit(now - 49 * hour, "five_hour", now - 46 * hour))
+            first = worth.measure([], now.timestamp())["rows"]
+            kept = [json.loads(line) for line in worth.windows_path().read_text().splitlines()]
+            self.assertEqual(os.stat(worth.windows_path()).st_mode & 0o777, 0o600)
+            later = worth.measure([], (now + timedelta(days=100)).timestamp())
+            again = worth.measure([], (now + timedelta(days=200)).timestamp())
+        self.assertEqual([(r["window"], r["method"], round(r["full"]["usd"])) for r in first], [("5h", "упор", 200)])
+        self.assertEqual((kept[0]["v"], kept[0]["full"]["usd"]), (worth.METHOD, first[0]["full"]["usd"]))
+        for result in (later, again):   # the transcripts are past the index; the window is still there
+            self.assertEqual([(r["window"], r["archived"], round(r["full"]["usd"])) for r in result["rows"]],
+                             [("5h", True, 200)])
+        self.assertEqual(later["data"]["archived"], 1)
+
     def test_a_segment_takes_the_plan_seen_in_it(self):
         plans = [(100.0, "Max 5x"), (480.0, "Max 5x"), (500.0, "Max 20x")]
         self.assertEqual(worth.plan_for(plans, 0, 400), "Max 5x")
@@ -579,7 +600,8 @@ class Statistics(unittest.TestCase):
             "usd_nobody": 102.0, "fits": {"claude-opus-5-5": {"r2": 0.92, "n": 99796}, "claude-fable-5": {"r2": None, "n": 51200}},
             "unpriced": {"claude-opus-6": 3}, "checks": {"matched": 187, "mismatched": [], "alone_matched": 16, "alone_mismatched": 0},
             "restarts": [{"email": "alice@example.com", "at": 1790700000.0}],
-            "plans": {"alice@example.com": [(1790600000.0, "Max 5x"), (1790800000.0, "Max 20x")]}, "coverage": {"2026-10-03": 5}}
+            "plans": {"alice@example.com": [(1790600000.0, "Max 5x"), (1790800000.0, "Max 20x")]},
+            "coverage": {"2026-10-03": 5}, "archived": 2}
 
     def test_statistics_tabs_show_the_segments_and_what_they_rest_on(self):
         exact = dict(self.ROW, segment=1, method="упор", pct=100.0, current=False, from_kind="reset", plan="Max 20x?",
@@ -594,7 +616,7 @@ class Statistics(unittest.TestCase):
         self.assertIn("точных замеров (упор): 1 · по API $2,236 · без чтения кэша $1,409", weeks)
         self.assertIn("5 часов · Max 20x", hours)
         self.assertNotIn("точных замеров", hours)   # a window opened elsewhere is shown, not summed up
-        for text in ("369 467 ответов", "выход оценён по содержимому ответа: $1,222 (6.5%)", "совпало 16 · не совпало 0",
+        for text in ("369 467 ответов", "старше индекса сейчас: 2", "выход оценён по содержимому ответа: $1,222 (6.5%)", "совпало 16 · не совпало 0",
                      "alice: Max 5x", "→ Max 20x", "Opus 5.5: по содержимому, R² 0.92 · 99 796 ответов",
                      "Fable 5: среднее по модели", "claude-opus-6 (3)"):
             self.assertIn(text, data)
