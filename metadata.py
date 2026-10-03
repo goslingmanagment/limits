@@ -124,11 +124,16 @@ def discover_codex():
     return list(groups.values()), supplemental
 
 
-def claude_plans():
-    paths = sorted((Path.home() / ".claude-swap-backup/configs").glob("*.json"))
-    paths.append(Path.home() / ".claude.json")
-    result = {}
-    for path in paths:
+def claude_profiles():
+    """Plans as cached profiles tell them: cswap's saved copies, then the live profile of the active account.
+
+    A saved copy is as old as the last switch away from its account; `fetched_at` is when
+    Claude Code last read the profile, which says little after a plan change.
+    """
+    paths = [(path, False) for path in sorted((Path.home() / ".claude-swap-backup/configs").glob("*.json"))]
+    paths.append((Path.home() / ".claude.json", True))
+    result = []
+    for path, live in paths:
         data = read_json(path)
         profile = (data.get("oauthAccount") or {}) if isinstance(data, dict) else {}
         email = profile.get("emailAddress")
@@ -137,9 +142,15 @@ def claude_plans():
         for multiplier in ("20x", "5x"):
             if tier.endswith("_" + multiplier):
                 plan += " " + multiplier
+        fetched = profile.get("profileFetchedAt")
         if email and plan:
-            result[email.casefold()] = plan
+            result.append({"email": email, "plan": plan, "live": live, "fetched_at": datetime.fromtimestamp(
+                fetched / 1000, timezone.utc).isoformat(timespec="seconds") if isinstance(fetched, (int, float)) else None})
     return result
+
+
+def claude_plans():
+    return {profile["email"].casefold(): profile["plan"] for profile in claude_profiles()}
 
 
 def subscription_path():

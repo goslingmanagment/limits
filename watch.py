@@ -4,11 +4,9 @@
 Единый список cswap, CodexBar и профилей Codex из Orca.
 Даты подписок: данные входа Codex и отдельно подтверждённые даты Claude.
 
-  python3 watch.py            # живой экран: ↑↓ Enter — переключить Claude, c — стоимость,
-                              # r — обновить, q — выход
+  python3 watch.py            # живой экран: ↑↓ Enter — переключить Claude, r — обновить, q — выход
   python3 watch.py --once     # один кадр и выход (годится для скриптов)
-  python3 watch.py --cost     # сколько стоят 1% и 100% окна: цена по API и токены
-  python3 watch.py --history  # сколько давали прошлые окна, по датам
+  python3 watch.py --stats    # статистика: сколько стоят 1% и 100% окон Claude, по неделям
 
 Частота опроса: Claude раз в 60 с, Codex раз в 300 с (его чтение дороже).
 """
@@ -33,13 +31,14 @@ from pathlib import Path
 
 from metadata import (claude_plans, discover_codex, load_subscriptions,
                       parse_date, save_subscription)
-from worth import (cache_dir, estimate, load_history, lookup, record_history, summary,
-                   window_spend)
+from stats import TABS, as_json, report, screen
+from worth import cache_dir, measure, observe
 
 CSWAP = os.path.expanduser("~/.local/bin/cswap")
 CODEXBAR = "/opt/homebrew/bin/codexbar"
 CLAUDE_EVERY = 60
 CODEX_EVERY = 300
+STATS_EVERY = 300
 BAR_WIDTH = 24
 # cswap caches usage of inactive accounts for several minutes; only older data is news.
 STALE_AFTER = 15 * 60
@@ -58,9 +57,10 @@ SELECT = "\033[48;5;237m"
 ACTIVE = "  ● активный"
 CODEX_DOWN = "CodexBar не отвечает (codexbar usage)"
 KEYS = {"\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+        "\x1b[C": "right", "\x1bOC": "right", "\x1b[D": "left", "\x1bOD": "left",
+        "s": "stats", "S": "stats", "ы": "stats", "Ы": "stats",
         "\r": "enter", "\n": "enter", "\x1b": "escape",
         "r": "refresh", "R": "refresh", "к": "refresh", "К": "refresh",
-        "c": "cost", "C": "cost", "с": "cost", "С": "cost", "$": "cost",
         "q": "quit", "Q": "quit", "й": "quit", "Й": "quit"}
 
 
@@ -147,11 +147,10 @@ def fetch_claude():
         # When a fetch fails cswap still reports the last good usage for display.
         u = fresh if isinstance(fresh, dict) else acc.get("lastGoodUsage")
         u = u if isinstance(u, dict) else {}
-        named = [(u.get(key), label, None) for key, label in (("fiveHour", "5h"), ("sevenDay", "7d"))]
-        # A model-scoped weekly window counts the usage of that model only.
-        named += [(sc, (sc.get("name") or "scoped")[:6], sc.get("name") or "scoped") for sc in u.get("scoped") or []
+        named = [(u.get(key), label) for key, label in (("fiveHour", "5h"), ("sevenDay", "7d"))]
+        named += [(sc, (sc.get("name") or "scoped")[:6]) for sc in u.get("scoped") or []
                   if isinstance(sc, dict)]
-        for w, label, scope in named:
+        for w, label in named:
             if not isinstance(w, dict) or percentage(w.get("pct")) is None:
                 continue
             windows.append(
@@ -163,7 +162,6 @@ def fetch_claude():
                     "ahead": bool(w.get("aheadOfPace")),
                     "runs_out_at": (w.get("projectedExhaustionAt")
                                     if w.get("willLastToReset") is False else None),
-                    **({"scope": scope} if scope else {}),
                 }
             )
         accounts.append(
@@ -437,69 +435,18 @@ def identity(acc, domain, subscription, now):
     return rows + [f"{YELLOW if warn else DIM}{text}{RESET}"]
 
 
-def bar(pct, width):
-    filled = max(0, min(width, round(width * pct / 100)))
-    return color_for(pct) + "━" * filled + RESET + DIM + "─" * (width - filled) + RESET
-
-
-def money(usd):
-    if usd < 10:
-        return f"${usd:.2f}"
-    if usd < 100:
-        return f"${usd:.1f}"
-    return f"${usd:,.0f}" if usd < 10000 else f"${usd / 1000:.1f}k"
-
-
-def tokens(n):
-    for size, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if n >= size:
-            return f"{n / size:.1f}{unit}" if n < 10 * size else f"{n / size:.0f}{unit}"
-    return f"{n:.0f}"
-
-
-def worth_cells(spent, pct, with_tokens=True):
-    """The cost view columns of a window: price and tokens of 1% and of 100% of it."""
-    one = estimate(spent, pct)
-    if not one:
-        return f"{DIM}—{RESET}", f"{DIM}—{RESET}"
-    usd, count = one["usd"], one["tokens"]
-    def cell(scale, strong):
-        amount = money(usd * scale)
-        tail = f" · {tokens(count * scale)}" if with_tokens else ""
-        if one["rough"]:
-            return f"{DIM}~{amount}{tail}{RESET}"
-        return f"{BOLD}{amount}{RESET}{tail}" if strong else amount + tail
-    return cell(1, False), cell(100, True)
-
-
-def model_name(model):
-    """claude-opus-5-5 -> Opus 5.5, claude-haiku-4-5-20251001 -> Haiku 4.5."""
-    parts = model.split("[")[0].casefold().replace("claude-", "", 1).split("-")
-    version = ".".join(part for part in parts[1:] if part.isdigit() and len(part) < 4)
-    return f"{parts[0].capitalize()} {version}".strip()
-
-
-def model_shares(models, total):
-    """Where a window's spend went: 'Opus 5.5 87% · Fable 5.1 11%'; a single model is just named."""
-    ranked = sorted(models.items(), key=lambda item: -item[1]["usd"])
-    if total <= 0 or not ranked:
-        return ""
-    if len(ranked) == 1:
-        return model_name(ranked[0][0])
-    return " · ".join(f"{model_name(model)} {part['usd'] / total * 100:.0f}%" for model, part in ranked
-                      if part["usd"] >= total / 100)
-
-
-def window_row(w, label_w, middle, reset_w, now):
+def window_row(w, label_w, bar_w, reset_w, now):
     pct = w["pct"]
-    number = f"{DIM if pct == 0 else BOLD + color_for(pct)}{pct:>3.0f}%{RESET}"
-    return (f"{w['label']:<{label_w}}  {number}  {middle}"
+    col = color_for(pct)
+    filled = max(0, min(bar_w, round(bar_w * pct / 100)))
+    bar = col + "━" * filled + RESET + DIM + "─" * (bar_w - filled) + RESET
+    number = f"{DIM if pct == 0 else BOLD + col}{pct:>3.0f}%{RESET}"
+    return (f"{w['label']:<{label_w}}  {number}  {bar}"
             f"   {DIM}{countdown(w.get('resets_at'), now):>{reset_w}}{RESET}")
 
 
 def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now=None,
-           cursor=None, status="", interactive=False, cost=False, spend=None):
-    """The table; with cost, the bars give way to what 1% and 100% of each Claude window are worth."""
+           cursor=None, status="", interactive=False):
     size = shutil.get_terminal_size((120, 40))
     width = max(1, size.columns - 1)
     now = now or datetime.now(timezone.utc)
@@ -516,45 +463,25 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
     # account that never counts down, so only the active Claude account gets it.
     alerts = [[pace_alert(w, now, acc["provider"] == "claude" and acc["active"]) for w in acc["windows"]]
               for acc, _ in accounts]
-    if cost:  # the alert column names the models each window's spend went to
-        shares = [[model_shares(spent["models"], spent["usd"]) if spent else ""
-                   for spent in (acc["provider"] == "claude" and lookup(spend, acc["email"], w)
-                                 for w in acc["windows"])] for acc, _ in accounts]
-        alerts = [[f"{DIM}{text}{RESET}" if text else "" for text in row] for row in shares]
-    def worth(with_tokens):
-        cells = [[worth_cells(acc["provider"] == "claude" and lookup(spend, acc["email"], w), w["pct"], with_tokens)
-                  for w in acc["windows"]] for acc, _ in accounts]
-        return (cells, max([len("за 1%")] + [visible(one) for row in cells for one, _ in row]),
-                max([len("за 100%")] + [visible(full) for row in cells for _, full in row]))
 
-    # Columns: slot | account | window label, percent, bar or cost, time to reset | alert.
+    # Columns: slot | account | window label, percent, bar, time to reset | alert.
     # Room for the active badge on every Claude name keeps the table still after a switch.
     name_w = max([visible(row) for rows in idents for row in rows]
                  + [visible(rows[0]) + len(ACTIVE) * (not acc["active"])
                     for (acc, _), rows in zip(accounts, idents) if acc["provider"] == "claude"], default=0)
     label_w = max((len(w["label"]) for w in windows), default=2)
     reset_w = max((len(countdown(w.get("resets_at"), now)) for w in windows), default=0)
+    alert_w = max((visible(alert) for row in alerts for alert in row), default=0)
     left_w = 5 + name_w + 3
-    def fixed_width():
-        alert_w = max((visible(alert) for row in alerts for alert in row), default=0)
-        return alert_w, left_w + label_w + 2 + 4 + 2 + 3 + reset_w + (3 + alert_w if alert_w else 0)
-    cells, one_w, full_w = worth(True) if cost else ([], 0, 0)
-    if cost and fixed_width()[1] + one_w + 3 + full_w > width:
-        # A narrow terminal gives up the models first, then the token counts; prices stay.
-        alerts = [[""] * len(row) for row in alerts]
-        if fixed_width()[1] + one_w + 3 + full_w > width:
-            cells, one_w, full_w = worth(False)
-    alert_w, fixed = fixed_width()
-    middle_w = one_w + 3 + full_w if cost else max(10, min(BAR_WIDTH, width - fixed))
-    alerts_inline = fixed + middle_w <= width
+    fixed = left_w + label_w + 2 + 4 + 2 + 3 + reset_w + (3 + alert_w if alert_w else 0)
+    bar_w = max(10, min(BAR_WIDTH, width - fixed))
+    alerts_inline = fixed + bar_w <= width
 
     blocks, chosen = [], None
-    for n, ((acc, age), rows, account_alerts) in enumerate(zip(accounts, idents, alerts)):
+    for (acc, age), rows, account_alerts in zip(accounts, idents, alerts):
         right = []
-        for k, (w, alert) in enumerate(zip(acc["windows"], account_alerts)):
-            middle = (pad(cells[n][k][0], one_w) + "   " + pad(cells[n][k][1], full_w) if cost
-                      else bar(w["pct"], middle_w))
-            right.append(window_row(w, label_w, middle, reset_w, now))
+        for w, alert in zip(acc["windows"], account_alerts):
+            right.append(window_row(w, label_w, bar_w, reset_w, now))
             if alert and alerts_inline:
                 right[-1] += "   " + alert
             elif alert:
@@ -578,22 +505,16 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
         blocks[chosen] = [SELECT + line.replace(RESET, RESET + SELECT) + " " * (table_w - visible(line)) + RESET
                           for line in blocks[chosen]]
 
-    middle_at = left_w + label_w + 2 + 4 + 2
-    reset_end = middle_at + middle_w + 3 + reset_w
+    reset_end = left_w + label_w + 2 + 4 + 2 + bar_w + 3 + reset_w
     def title_line(title):
         line = f"  {BOLD}{title}{RESET}"
-        if cost and title == "CLAUDE":
-            for header, at in (("за 1%", middle_at), ("за 100%", middle_at + one_w + 3)):
-                line += " " * max(2, at - visible(line)) + f"{DIM}{header}{RESET}"
         if not reset_w:
             return line
-        line += " " * max(2, reset_end - 11 - visible(line)) + f"{DIM}сброс через{RESET}"
-        return line + f"   {DIM}модели{RESET}" if cost and title == "CLAUDE" and alerts_inline and alert_w else line
+        return line + " " * max(2, reset_end - 11 - visible(line)) + f"{DIM}сброс через{RESET}"
 
-    hint = (f"↑↓ выбрать · Enter переключить · c {'лимиты' if cost else 'стоимость'} · r обновить · q выход"
-            if interactive else "переключить Claude: cswap switch <номер>")
-    legend = [f"  {DIM}цена API и токены с кэшем · только расход на этом Mac · ~ окно < 10%{RESET}"] if cost else []
-    footer = [""] + [f"  {RED}{e}{RESET}" for e in errors] + ([f"  {status}"] if status else []) + legend + [
+    hint = ("↑↓ выбрать · Enter переключить · s статистика · r обновить · q выход" if interactive
+            else "переключить Claude: cswap switch <номер>")
+    footer = [""] + [f"  {RED}{e}{RESET}" for e in errors] + ([f"  {status}"] if status else []) + [
         f"  {DIM}{hint}   ·   обновлено {now.astimezone():%H:%M}{RESET}"]
     # A blank line before every account only when everything still fits on the screen.
     tight = 2 * len(groups) - 1 + sum(map(len, blocks)) + len(footer)
@@ -677,48 +598,6 @@ def switch_note(result, error):
     return f"{DIM}{result.get('message') or 'без изменений'}{RESET}"
 
 
-def measure(accounts):
-    """Spend in each Claude window; every estimate that has moved on also goes to the history."""
-    spend = window_spend(accounts)
-    record_history(accounts, spend)
-    return spend
-
-
-def history_report(entries, now=None):
-    """The final estimate of every window in the history, by window and plan, oldest first."""
-    now = now or datetime.now(timezone.utc)
-    groups = {}
-    for entry in entries:
-        # Short windows pile up; the ones measured past rounding say enough.
-        if entry.get("per_percent") and not (entry["window"] == "5h" and entry.get("rough")):
-            groups.setdefault((entry["window"] != "7d", entry["window"] == "5h", entry["window"],
-                               entry.get("plan") or ""), []).append(entry)
-    if not groups:
-        return "  история пуста: она пишется, пока открыт limits или вызывается limits --cost"
-    lines = []
-    for (_, five, label, plan), group in sorted(groups.items()):
-        group = group[-12:] if five else group
-        rows = []
-        for e in group:
-            resets = parse_date(e["resets_at"])
-            one, full = e["per_percent"], e["full"]
-            mark = "~" if e.get("rough") else ""
-            rows.append((f"{resets.astimezone():%d.%m %H:%M}" + (" идёт" if resets > now else ""),
-                         e["email"].split("@")[0], f"{e['pct']:.0f}%",
-                         f"{mark}{money(one['usd'])} · {tokens(one['tokens'])}",
-                         f"{mark}{money(full['usd'])} · {tokens(full['tokens'])}",
-                         model_shares(e.get("models") or {}, e.get("spent_usd") or 0)))
-        head = ("окно до", "аккаунт", "%", "за 1%", "за 100%", "модели")
-        widths = [max(len(row[i]) for row in rows + [head]) for i in range(5)]
-        lines += ["", f"  {BOLD}{label} · {plan or 'тариф неизвестен'}{RESET}",
-                  f"  {DIM}" + "   ".join(h.ljust(w) if i != 2 else h.rjust(w) for i, (h, w) in
-                                           enumerate(zip(head, widths + [0]))).rstrip() + RESET]
-        for row in rows:
-            lines.append("  " + "   ".join(c.ljust(w) if i != 2 else c.rjust(w)
-                                           for i, (c, w) in enumerate(zip(row, widths + [0]))).rstrip())
-    return "\n".join(lines[1:])
-
-
 def snapshot(args, subscriptions, color):
     try:
         claude, claude_error = fetch_claude(), ""
@@ -731,27 +610,49 @@ def snapshot(args, subscriptions, color):
     moment = datetime.now(timezone.utc)
     claude, codex = roll_over(claude, moment), roll_over(codex, moment)
     accounts = (claude or []) + (codex or [])
-    spend = None
-    if args.cost and claude:
-        try:
-            spend = measure(claude)
-        except (OSError, sqlite3.Error) as error:
-            errors.append(f"расход и история не обновлены: {error}")
     if args.json:
         for acc in accounts:
             acc["subscription"] = subscriptions.get(
                 acc["provider"] + ":" + acc["email"].casefold(), acc.get("subscription"))
-            for w in acc["windows"] if spend is not None and acc["provider"] == "claude" else []:
-                w["cost"] = summary(lookup(spend, acc["email"], w), w["pct"])
         print(json.dumps({"accounts": accounts, "errors": errors}, ensure_ascii=False, indent=2))
     else:
-        frame = render(claude, codex, 0.0, 0.0, errors, subscriptions, cost=args.cost, spend=spend)
+        frame = render(claude, codex, 0.0, 0.0, errors, subscriptions)
         print(frame if color else ANSI.sub("", frame))
     return 0 if any(a["windows"] for a in accounts) else 1
 
 
-def live(subscriptions, color, cost=False):
-    """The live screen: sources refresh in the background, keys switch the Claude account and the view."""
+def poll_claude(failed):
+    """Claude's limits; what they show now is also kept for the statistics, which cannot ask again later."""
+    accounts = fetch_claude()
+    try:
+        observe(accounts)
+        failed["observe"] = ""
+    except Exception as error:  # the limits themselves must show whatever happens to the statistics
+        failed["observe"] = f"наблюдения для статистики не записаны: {error}"
+    return accounts
+
+
+def statistics(args, color):
+    """`--observe` keeps what the statistics need and leaves; `--stats` also measures and prints."""
+    try:
+        claude = fetch_claude()
+        observe(claude)
+        if not args.stats:
+            return 0
+        result = measure(claude)
+    except FetchError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except (OSError, sqlite3.Error) as error:
+        print(f"статистика не посчитана: {error}", file=sys.stderr)
+        return 1
+    text = as_json(result) if args.json else report(result)
+    print(text if color or args.json else ANSI.sub("", text))
+    return 0
+
+
+def live(subscriptions, color):
+    """The live screen: sources refresh in the background, keys switch the Claude account or the view."""
     fd = sys.stdin.fileno() if sys.stdin.isatty() else None
     saved = termios.tcgetattr(fd) if fd is not None else None
     if fd is not None:
@@ -759,22 +660,21 @@ def live(subscriptions, color, cost=False):
     # Like any full-screen tool: own screen, no cursor; the shell's screen returns on exit.
     sys.stdout.write("\033[?1049h\033[?25l")
     try:
-        sources = {"claude": (fetch_claude, CLAUDE_EVERY), "codex": (fetch_codex, CODEX_EVERY)}
+        failed = {"claude": "", "codex": "", "observe": "", "stats": ""}
+        sources = {"claude": (lambda: poll_claude(failed), CLAUDE_EVERY), "codex": (fetch_codex, CODEX_EVERY)}
         data = {"claude": None, "codex": load_codex_cache()}
         fetched = {"claude": 0.0, "codex": 0.0}
-        failed = {"claude": "", "codex": "", "spend": ""}
-        # Usage is measured in the background with every view, so the history keeps growing;
-        # the very first pass indexes a week of transcripts.
-        spend, spent_at = None, 0.0
         jobs, cursor, note, note_until, refreshing = {}, None, "", 0.0, False
+        # The statistics screen: measured on entry and every few minutes while it is open.
+        view, tab, scroll, measured, measured_at = "limits", 0, 0, None, 0.0
         began, drawn_at, drawn_size = time.time(), 0.0, None
         while True:
             changed = False
             for name, (fetch, every) in sources.items():
                 if name not in jobs and time.time() - fetched[name] >= every:
                     jobs[name] = background(fetch)
-            if data["claude"] and "spend" not in jobs and time.time() - spent_at >= CLAUDE_EVERY:
-                jobs["spend"] = background(lambda accounts=data["claude"]: measure(accounts))
+            if view == "stats" and data["claude"] and "stats" not in jobs and time.time() - measured_at >= STATS_EVERY:
+                jobs["stats"] = background(lambda accounts=data["claude"]: measure(accounts))
             for name in [name for name, job in jobs.items() if not job["thread"].is_alive()]:
                 job, changed = jobs.pop(name), True
                 result, error = job.get("result"), job.get("error")
@@ -786,9 +686,9 @@ def live(subscriptions, color, cost=False):
                     cursor, fetched["claude"] = None, 0.0
                     note, note_until = switch_note(result, error), time.time() + 8
                     continue
-                if name == "spend":
-                    spent_at, spend = time.time(), spend if error else result
-                    failed[name] = f"расход и история не обновлены: {error}" if error else ""
+                if name == "stats":
+                    measured_at, measured = time.time(), measured if error else result
+                    failed[name] = f"статистика не посчитана: {error}" if error else ""
                     continue
                 fetched[name] = time.time()
                 if name == "claude":
@@ -810,10 +710,24 @@ def live(subscriptions, color, cost=False):
                 target = next((a for a in data["claude"] or [] if a.get("slot") == cursor), None)
                 if key == "quit":
                     return 0
-                if key == "refresh":
-                    fetched, spent_at, refreshing = dict.fromkeys(fetched, 0.0), 0.0, True
-                elif key == "cost":
-                    cost = not cost
+                if view == "stats":
+                    if key in ("stats", "escape"):
+                        view = "limits"
+                    elif key == "refresh":
+                        measured_at = 0.0
+                    elif key in ("left", "right"):
+                        tab, scroll = (tab + (1 if key == "right" else -1)) % len(TABS), 0
+                    elif key in ("up", "down"):
+                        scroll = max(0, scroll + (1 if key == "down" else -1))
+                    elif key.isdigit() and 1 <= int(key) <= len(TABS):
+                        tab, scroll = int(key) - 1, 0
+                    continue
+                if key == "stats":
+                    view = "stats"
+                elif key in ("left", "right"):
+                    continue
+                elif key == "refresh":
+                    fetched, refreshing = dict.fromkeys(fetched, 0.0), True
                 elif key == "enter" and target and "switch" not in jobs:
                     if target["active"]:
                         cursor, note, note_until = None, f"{short_name(target)} уже активный", time.time() + 5
@@ -836,8 +750,6 @@ def live(subscriptions, color, cost=False):
                 status = note
             elif refreshing:
                 status = f"{DIM}обновляю…{RESET}"
-            elif cost and spend is None and "spend" in jobs:
-                status = f"{DIM}считаю расход по транскриптам…{RESET}"
             elif data["codex"] is None and "codex" in jobs:
                 status = f"{DIM}Codex: загрузка…{RESET}"
             else:
@@ -845,9 +757,15 @@ def live(subscriptions, color, cost=False):
             moment = datetime.now(timezone.utc)
             claude, codex = roll_over(data["claude"], moment), roll_over(data["codex"], moment)
             ages = {name: time.time() - fetched[name] if fetched[name] else None for name in fetched}
-            frame = render(claude, codex, ages["claude"], ages["codex"], [m for m in failed.values() if m],
-                           subscriptions, cursor=cursor, status=status, interactive=fd is not None,
-                           cost=cost, spend=spend)
+            if view == "stats":
+                waiting = ("считаю расход по транскриптам… первый раз около минуты" if measured is None
+                           else "пересчитываю…") if "stats" in jobs else ""
+                status = f"{RED}{failed['stats'] or failed['observe']}{RESET}" if failed["stats"] or failed["observe"] \
+                    else f"{DIM}{waiting}{RESET}" if waiting else ""
+                frame, scroll = screen(measured, tab, scroll, size.columns, size.lines, status)
+            else:
+                frame = render(claude, codex, ages["claude"], ages["codex"], [m for m in failed.values() if m],
+                               subscriptions, cursor=cursor, status=status, interactive=fd is not None)
             if not color:
                 frame = ANSI.sub("", frame)
             # Overwrite in place inside a synchronized update instead of clearing: no flicker.
@@ -868,9 +786,10 @@ def main():
     parser.add_argument("--once", action="store_true", help="один кадр и выход")
     parser.add_argument("--json", action="store_true", help="один снимок JSON")
     parser.add_argument("--no-color", action="store_true", help="без ANSI-цветов")
-    parser.add_argument("--cost", action="store_true",
-                        help="сколько стоят 1%% и 100%% окна Claude: цена по API и токены локального расхода")
-    parser.add_argument("--history", action="store_true", help="итог каждого прошлого окна Claude по датам")
+    parser.add_argument("--stats", action="store_true",
+                        help="статистика Claude: сколько стоят 1%% и 100%% окон, по неделям (с --json — данными)")
+    parser.add_argument("--observe", action="store_true",
+                        help="записать текущие проценты Claude для статистики и выйти (для запуска по расписанию)")
     parser.add_argument("--set-subscription", nargs=3, metavar=("PROVIDER", "EMAIL", "YYYY-MM-DD"),
                         help="запомнить подтверждённую дату; не продлевает подписку")
     parser.add_argument("--renews", action="store_true", help="дата означает автопродление")
@@ -887,12 +806,10 @@ def main():
         return 2
     once = args.once or args.json or not sys.stdout.isatty()
     color = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
-    if args.history:
-        report = history_report(load_history())
-        print(report if color else ANSI.sub("", report))
-        return 0
+    if args.stats or args.observe:
+        return statistics(args, color)
     try:
-        return snapshot(args, subscriptions, color) if once else live(subscriptions, color, args.cost)
+        return snapshot(args, subscriptions, color) if once else live(subscriptions, color)
     except KeyboardInterrupt:
         return 0
 
