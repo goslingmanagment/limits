@@ -435,6 +435,28 @@ def identity(acc, domain, subscription, now):
     return rows + [f"{YELLOW if warn else DIM}{text}{RESET}"]
 
 
+def weekly_left(accounts, now):
+    """Weekly percent the accounts of one provider still have until the first of them resets.
+
+    An account without a weekly reading is left out and counted, never taken as unused.
+    """
+    weekly = [next((w for w in acc["windows"] if w["label"] == "7d"), None) for acc in accounts]
+    known = [w for w in weekly if w]
+    if not known:
+        return ""
+    left = sum(max(0.0, 100 - w["pct"]) for w in known)
+    text = f"осталось {BOLD}{left:.0f}%{RESET}"
+    resets = [m for m in (parse_date(w.get("resets_at")) for w in known) if m and m > now]
+    if resets:
+        seconds = (min(resets) - now).total_seconds()
+        text += f" на {span(seconds)}"
+        # Under a day the whole remainder is the budget; a daily rate would only inflate it.
+        if seconds >= 86400:
+            text += f" · ≈{BOLD}{left * 86400 / seconds:.0f}%{RESET} в день"
+    missing = len(weekly) - len(known)
+    return text + (f" · {YELLOW}без данных: {missing}{RESET}" if missing else "")
+
+
 def window_row(w, label_w, bar_w, reset_w, now):
     pct = w["pct"]
     col = color_for(pct)
@@ -506,8 +528,11 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
                           for line in blocks[chosen]]
 
     reset_end = left_w + label_w + 2 + 4 + 2 + bar_w + 3 + reset_w
-    def title_line(title):
+    def title_line(title, group):
         line = f"  {BOLD}{title}{RESET}"
+        left = weekly_left(group, now)
+        if left:
+            line += "   " + left
         if not reset_w:
             return line
         return line + " " * max(2, reset_end - 11 - visible(line)) + f"{DIM}сброс через{RESET}"
@@ -523,7 +548,7 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
     for title, group, _ in groups:
         if lines:
             lines.append("")
-        lines.append(title_line(title))
+        lines.append(title_line(title, group))
         for block in blocks[i:i + len(group)]:
             if spacious:
                 lines.append("")
