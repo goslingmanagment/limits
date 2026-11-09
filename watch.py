@@ -819,7 +819,13 @@ def main():
                         help="запомнить подтверждённую дату; не продлевает подписку")
     parser.add_argument("--renews", action="store_true", help="дата означает автопродление")
     parser.add_argument("--subscription-source", default="вручную", help="источник подтверждённой даты")
+    parser.add_argument("--history", action="store_true",
+                        help="собрать токены Claude и Codex по дням за всё время в ~/.local/share/limits/history "
+                             "(запускать перед тем, как уносить старые стенограммы)")
     args = parser.parse_args()
+    if args.history:
+        from history import build
+        return build()
     try:
         if args.set_subscription:
             save_subscription(*args.set_subscription, renews=args.renews, source=args.subscription_source)
