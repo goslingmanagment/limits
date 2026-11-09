@@ -316,7 +316,10 @@ def build(out_dir=None):
         s["output"] += out
         s["models"].add(model)
 
-    restored = restore_from_ccusage(daily)
+    stored = read_csv(out_dir / "daily.csv")
+    # A stored day already holds what the snapshot could add, split by tool; refilling it from
+    # the snapshot after its transcripts moved away would trade that split for one coarse row.
+    restored = restore_from_ccusage(daily, skip_days={row[0] for row in stored})
     print(f"Дополнено из сводок ccusage: {restored / 1e9:.2f} млрд токенов", flush=True)
 
     daily_header = ["date", "vendor", "tool", "account", "model", "scope", "requests", "input", "cache_read",
@@ -329,7 +332,6 @@ def build(out_dir=None):
                      " ".join(sorted(s["models"]))] for key, s in sessions.items()]
 
     # A stored day is replaced only by a fuller one, so moving transcripts away never lowers it.
-    stored = read_csv(out_dir / "daily.csv")
     by_day = defaultdict(lambda: [[], []])
     for row in stored:
         by_day[row[0]][0].append(row)
@@ -339,7 +341,7 @@ def build(out_dir=None):
     merged = []
     for date, (old, new) in by_day.items():
         total = lambda rows: sum(int(r[11]) for r in rows)
-        if old and total(old) > total(new):
+        if old and total(old) >= total(new):
             merged += old
             kept_days += 1
         else:
@@ -357,8 +359,10 @@ def build(out_dir=None):
     return 0
 
 
-def restore_from_ccusage(daily):
-    """Adds what ccusage saw on a day and the transcripts no longer hold (files deleted since), per model."""
+def restore_from_ccusage(daily, skip_days=()):
+    """Adds what ccusage saw on a day and the transcripts no longer hold (files deleted since), per model.
+
+    Days in skip_days are left alone: the stored copy already has them."""
     added = 0
     for path in sorted((ARCHIVE / "claude-code").glob("ccusage-daily-*.json")):
         taken = path.stem.rsplit("-", 3)[-3:]
@@ -373,8 +377,8 @@ def restore_from_ccusage(daily):
                 m[3] += v[3]
         for entry in json.load(open(path)).get("daily", []):
             date = entry.get("period")
-            if not date or date >= snapshot_day:
-                continue  # the snapshot's last day was still going
+            if not date or date >= snapshot_day or date in skip_days:
+                continue  # the snapshot's last day was still going, or the day is stored already
             for b in entry.get("modelBreakdowns", []):
                 model = b.get("modelName", "")
                 theirs = (b.get("inputTokens", 0), b.get("outputTokens", 0), b.get("cacheReadTokens", 0),
