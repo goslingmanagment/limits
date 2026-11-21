@@ -990,7 +990,7 @@ def live(subscriptions, color):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Лимиты и подписки Claude + Codex (включая профили Orca)")
+    parser = argparse.ArgumentParser(description="Лимиты и подписки Claude + Codex (включая профили Orca) + Antigravity")
     parser.add_argument("--once", action="store_true", help="один кадр и выход")
     parser.add_argument("--json", action="store_true", help="один снимок JSON")
     parser.add_argument("--no-color", action="store_true", help="без ANSI-цветов")
