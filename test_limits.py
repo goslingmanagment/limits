@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -152,6 +153,93 @@ class Accounts(unittest.TestCase):
         self.assertEqual(accounts[0]["windows"], [])
         self.assertTrue(accounts[0]["error"])
         self.assertEqual(accounts[1]["windows"][0]["pct"], 10)
+
+    def test_antigravity_windows_never_guess_a_number(self):
+        asked = datetime(2026, 11, 21, 3, 22, 59, tzinfo=timezone.utc)
+        def bucket(ident, window, **fields):
+            return dict(bucketId=ident, window=window, **fields)
+        groups = [{"displayName": "Claude and GPT models", "buckets": [
+                      bucket("3p-weekly", "weekly", remainingFraction=1, resetTime="2026-11-28T03:23:30Z"),  # untouched
+                      bucket("3p-5h", "5h", remainingFraction=0, resetTime="2026-11-21T05:00:00.5Z")]},       # spent
+                  {"displayName": "Gemini Models", "buckets": [
+                      bucket("gemini-5h", "5h", remainingFraction=1, resetTime="2026-11-21T08:22:59Z",
+                             description="You have used some of your 5-hour limit"),  # full again, still counting
+                      bucket("gemini-weekly", "weekly", remainingFraction=0.5, disabled=True,
+                             resetTime="2026-11-27T21:28:33Z")]},
+                  {"displayName": "Image models", "buckets": [
+                      bucket("img-weekly", "weekly", remainingAmount=40),
+                      bucket("img-5h", "5h", remainingFraction=True),
+                      bucket("img-day", "daily", remainingFraction=1.5)]}]
+        windows, missing, amounts = watch.antigravity_windows(groups, asked)
+        self.assertEqual([(w["label"], w["pct"], w["resets_at"]) for w in windows],
+                         [("Gemini 5h", 0.0, "2026-11-21T08:22:59+00:00"), ("Cl/GPT 7d", 0.0, None),
+                          ("Cl/GPT 5h", 100.0, "2026-11-21T05:00:00.500000+00:00")])
+        self.assertEqual(missing, ["Gemini 7d", "Image 7d", "Image 5h", "Image daily"])
+        self.assertEqual(amounts, {"Image 7d": 40})
+
+    def test_antigravity_tokens_stay_in_memory_and_the_tier_waits_12_hours(self):
+        now = datetime.now(timezone.utc)
+        def signin(email, token, minutes):
+            expiry = (now + timedelta(minutes=minutes)).astimezone(timezone(timedelta(hours=3)))
+            return json.dumps({"auth_method": "consumer", "id_token_email": email, "token": {
+                "access_token": token, "refresh_token": "refresh-" + token, "token_type": "Bearer",
+                "expiry": expiry.strftime("%Y-%m-%dT%H:%M:%S.35+03:00")}})
+        quota = {"groups": [{"displayName": "Gemini Models", "buckets": [
+            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.91,
+             "resetTime": (now + timedelta(days=6)).isoformat()}]}]}
+        tier, calls = {"paidTier": {"id": "g1-ultra-lite-tier", "name": "Google AI Ultra"},
+                       "currentTier": {"id": "free-tier", "name": "Antigravity"}}, []
+        def poll(previous, tier_answer, quota_answer=quota):
+            def post(url, token, body):
+                calls.append((url.rpartition(":")[2], token, body))
+                answer = tier_answer if url == watch.TIER_URL else quota_answer
+                if answer is None:
+                    raise urllib.error.URLError("offline")
+                return answer
+            calls.clear()
+            with patch.object(watch, "google", side_effect=post):
+                return watch.merge_last_good(previous, watch.fetch_antigravity(previous))
+        keychain = metadata.KEYRING_PREFIX + base64.b64encode(signin("user@example.com", "token-keychain", 50).encode()).decode()
+        with tempfile.TemporaryDirectory() as tmp, patch("pathlib.Path.home", return_value=Path(tmp)), \
+                patch.dict(os.environ, {"XDG_CACHE_HOME": tmp + "/cache"}), \
+                patch.object(metadata, "keychain_secret", return_value=keychain):
+            for profile, (email, token, minutes) in {"a": ("user@example.com", "token-t3", 10),
+                                                     "b": ("second@example.com", "token-second", -5)}.items():
+                path = Path(tmp, ".t3/userdata/providers/antigravity", profile, "antigravity-acp/antigravity-oauth-token")
+                path.parent.mkdir(parents=True)
+                path.write_text(signin(email, token, minutes))
+            # Two emails, two accounts; the token that lasts longest is the one used, the expired one asks nothing.
+            first = poll(None, None)
+            self.assertEqual([(a["email"], a["error"]) for a in first],
+                             [("user@example.com", ""), ("second@example.com", watch.EXPIRED)])
+            self.assertEqual([c[:2] for c in calls], [("retrieveUserQuotaSummary", "token-keychain"),
+                                                      ("loadCodeAssist", "token-keychain")])
+            self.assertEqual(calls[0][2], {})
+            self.assertNotIn("plan", first[0])
+            watch.save_antigravity_cache(first)
+            cached = watch.load_cache("antigravity")
+            self.assertEqual([a["email"] for a in cached], ["user@example.com"])
+            # The failed tier check counts; the expired account keeps its last numbers.
+            gone = dict(provider="antigravity", email="second@example.com", windows=[
+                {"label": "Gemini 7d", "pool": "Gemini", "period": "7d", "pct": 40.0}], fetched_at=now.isoformat())
+            second = poll(cached + [gone], tier)
+            self.assertEqual([c[0] for c in calls], ["retrieveUserQuotaSummary"])
+            self.assertEqual((second[1]["error"], second[1]["windows"]), (watch.EXPIRED, gone["windows"]))
+            self.assertIn("вход истёк", watch.notice_text(second[1], None, now))
+            third = poll([dict(cached[0], plan_attempted_at=(now - timedelta(hours=13)).isoformat())], tier)
+            self.assertEqual((third[0]["plan"], third[0]["plan_id"], len(calls)), ("AI Ultra", "g1-ultra-lite-tier", 2))
+            failed = poll(third, tier, None)  # the quota request fails: the plan and the numbers stay
+            self.assertEqual((failed[0]["error"], failed[0]["plan"], failed[0]["windows"]),
+                             ("Antigravity не отвечает", "AI Ultra", third[0]["windows"]))
+            down = [dict(provider="antigravity", email="user@example.com", windows=[], error="Antigravity не отвечает")]
+            self.assertEqual(watch.merge_last_good(third, down)[0]["plan_id"], "g1-ultra-lite-tier")
+            watch.save_antigravity_cache(third)
+            watch.save_antigravity_cache(failed)  # never over the last clean reading
+            self.assertEqual([(a["plan"], a["error"]) for a in watch.load_cache("antigravity")], [("AI Ultra", "")])
+            text =watch.cache_path("antigravity").read_text() + json.dumps(first + second + third + failed)
+            self.assertEqual(os.stat(watch.cache_path("antigravity")).st_mode & 0o777, 0o600)
+        for secret in ("token-keychain", "token-t3", "token-second", "refresh-"):
+            self.assertNotIn(secret, text)
 
 
 class Subscriptions(unittest.TestCase):
@@ -305,6 +393,41 @@ class Display(unittest.TestCase):
         self.assertEqual(watch.shared_domain(same), "gmail.com")
         self.assertEqual(watch.shared_domain(same + [dict(email="c@corp.com")]), "")
         self.assertEqual(watch.shared_domain([dict(email="codex")]), "")
+
+    def test_antigravity_section_follows_the_gemini_pool(self):
+        now = datetime(2026, 11, 21, 7, 0, tzinfo=timezone.utc)
+        def window(pool, period, pct, hours=None):
+            return {"label": f"{pool} {period}", "pool": pool, "period": period, "pct": pct,
+                    "resets_at": hours and (now + timedelta(hours=hours)).isoformat()}
+        gemini = [window("Gemini", "7d", 9, 158), window("Gemini", "5h", 30, 3.67)]
+        google = dict(provider="antigravity", email="user@example.com", plan="AI Ultra", active=False,
+                      windows=gemini + [window("Cl/GPT", "7d", 0), window("Cl/GPT", "5h", 0)], missing=[])
+        week = {"label": "7d", "pct": 20, "resets_at": (now + timedelta(days=2)).isoformat()}
+        five = {"label": "5h", "pct": 40, "resets_at": (now + timedelta(hours=2)).isoformat()}
+        claude = [dict(provider="claude", email=f"claude{i}@example.com", slot=i + 1, active=i == 0,
+                       windows=[five, week]) for i in range(3)]
+        # CodexBar names an account it cannot place "codex": no email, so no domain to break the sharing.
+        codex = [dict(provider="codex", email="codex", active=False, windows=[week]),
+                 dict(provider="codex", email="bob@example.com", active=False, windows=[week])]
+        def screen(columns, rows, account):
+            with patch.object(watch.shutil, "get_terminal_size", return_value=os.terminal_size((columns, rows))):
+                return watch.ANSI.sub("", watch.render(claude, codex, 0, 0, [], now=now,
+                                                       antigravity=[account])).splitlines()
+        lines = screen(120, 24, google)
+        self.assertLessEqual(len(lines), 23)
+        self.assertTrue(all(len(line) <= 119 for line in lines))
+        self.assertNotIn("@example.com", "\n".join(lines))
+        header = next(line for line in lines if line.startswith("  ANTIGRAVITY"))
+        self.assertIn("осталось 91% на 6d 14h · ≈14% в день", header)
+        self.assertNotIn("Cl/GPT", "\n".join(lines))   # the unused pool stays out of the screen
+        used = dict(google, windows=gemini + [window("Cl/GPT", "7d", 12, 100)], missing=["Cl/GPT 5h"])
+        for columns in (120, 80):
+            lines = screen(columns, 40, used)
+            self.assertTrue(all(len(line) < columns for line in lines))
+            self.assertTrue(all("сброс через" in line for line in lines if "сброс" in line))
+            self.assertIn("· Cl/GPT 88%", next(line for line in lines if line.startswith("  ANTIGRAVITY")))
+            self.assertEqual(sum("Cl/GPT 7d" in line for line in lines), 1)
+            self.assertIn("нет данных: Cl/GPT 5h", "\n".join(lines))
 
     def test_normal_cache_age_is_not_reported(self):
         now = datetime.now(timezone.utc)

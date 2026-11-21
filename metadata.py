@@ -3,6 +3,8 @@
 import base64
 import json
 import os
+import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +19,8 @@ def read_json(path):
 def parse_date(value):
     if not isinstance(value, str) or not value:
         return None
+    # Go and protobuf write 1–9 digits of a second; Python before 3.11 reads only 3 or 6.
+    value = re.sub(r"(?<=:\d\d)\.\d+", lambda m: (m.group() + "00000")[:7], value, count=1)
     try:
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return result if result.tzinfo else result.replace(tzinfo=timezone.utc)
@@ -153,6 +157,55 @@ def claude_plans():
     return {profile["email"].casefold(): profile["plan"] for profile in claude_profiles()}
 
 
+KEYRING_PREFIX = "go-keyring-base64:"
+
+
+def keychain_secret():
+    """Antigravity's sign-in as agy keeps it in the login keychain; "" when it is not there."""
+    try:
+        p = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"],
+                           capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def antigravity_signins():
+    """Antigravity sign-ins from the keychain and T3 Code profiles: one per email, with the token that lasts longest.
+
+    The token is handed over for a request to Google only; it is never written, cached or shown.
+    A source that cannot be read or parsed is skipped.
+    """
+    texts = [keychain_secret()]
+    root = Path.home() / ".t3/userdata/providers/antigravity"
+    for path in sorted(root.glob("*/antigravity-acp/antigravity-oauth-token")):
+        try:
+            texts.append(path.read_text())
+        except OSError:
+            pass
+    found = {}
+    for text in texts:
+        try:
+            if text.startswith(KEYRING_PREFIX):
+                text = base64.b64decode(text[len(KEYRING_PREFIX):]).decode()
+            data = json.loads(text)
+        except ValueError:
+            continue
+        email = data.get("id_token_email") if isinstance(data, dict) else None
+        if not isinstance(email, str) or "@" not in email:
+            continue
+        token = data.get("token") if isinstance(data.get("token"), dict) else {}
+        access = token.get("access_token")
+        item = {"email": email, "method": str(data.get("auth_method") or ""),
+                "token": access if isinstance(access, str) else "", "expires": parse_date(token.get("expiry"))}
+        def lasts(signin):
+            return signin["expires"] or datetime.min.replace(tzinfo=timezone.utc)
+        earlier = found.get(email.casefold())
+        if not earlier or lasts(item) > lasts(earlier):
+            found[email.casefold()] = item
+    return list(found.values())
+
+
 def subscription_path():
     return Path(os.environ.get("LIMITS_SUBSCRIPTIONS", "~/.config/limits/subscriptions.json")).expanduser()
 
@@ -173,8 +226,8 @@ def load_subscriptions():
 
 
 def save_subscription(provider, email, until, renews=False, source="вручную"):
-    if provider not in ("claude", "codex") or "@" not in email or not parse_date(until):
-        raise ValueError("ожидается: claude|codex email YYYY-MM-DD")
+    if provider not in ("claude", "codex", "antigravity") or "@" not in email or not parse_date(until):
+        raise ValueError("ожидается: claude|codex|antigravity email YYYY-MM-DD")
     data = load_subscriptions()
     data[provider + ":" + email.casefold()] = {
         "until": until, "kind": "renews" if renews else "period", "source": source,

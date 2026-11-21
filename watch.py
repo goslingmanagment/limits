@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Единый экран лимитов: Claude (через claude-swap) + Codex (через CodexBar).
+"""Единый экран лимитов: Claude (через claude-swap) + Codex (через CodexBar) + Antigravity (как в T3 Code).
 
 Единый список cswap, CodexBar и профилей Codex из Orca.
-Даты подписок: данные входа Codex и отдельно подтверждённые даты Claude.
+Даты подписок: данные входа Codex и отдельно подтверждённые даты Claude и Antigravity.
 
   python3 watch.py            # живой экран: ↑↓ Enter — переключить Claude, r — обновить, q — выход
   python3 watch.py --once     # один кадр и выход (годится для скриптов)
   python3 watch.py --stats    # статистика: сколько стоят 1% и 100% окон Claude, по неделям
 
-Частота опроса: Claude раз в 60 с, Codex раз в 300 с (его чтение дороже).
+Частота опроса: Claude раз в 60 с, Codex и Antigravity раз в 300 с (их чтение дороже).
 """
 
 import argparse
+import http.client
 import json
 import math
 import os
@@ -26,10 +27,12 @@ import termios
 import threading
 import time
 import tty
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from metadata import (claude_plans, discover_codex, load_subscriptions,
+from metadata import (antigravity_signins, claude_plans, discover_codex, load_subscriptions,
                       parse_date, save_subscription)
 from stats import TABS, as_json, report, screen
 from worth import cache_dir, measure, observe
@@ -38,6 +41,10 @@ CSWAP = os.path.expanduser("~/.local/bin/cswap")
 CODEXBAR = "/opt/homebrew/bin/codexbar"
 CLAUDE_EVERY = 60
 CODEX_EVERY = 300
+ANTIGRAVITY_EVERY = 300
+# The tier rarely changes; a failed check waits as long as a good one.
+PLAN_EVERY = timedelta(hours=12)
+PLAN_FIELDS = ("plan", "plan_id", "plan_checked_at", "plan_attempted_at")
 STATS_EVERY = 300
 BAR_WIDTH = 24
 # cswap caches usage of inactive accounts for several minutes; only older data is news.
@@ -271,6 +278,128 @@ def fetch_codex():
     return accounts or None
 
 
+QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+TIER_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+# Antigravity's own client, as T3 Code sends it.
+AGENT = "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
+EXPIRED = "вход истёк — открой Antigravity, чтобы обновить"
+PERIODS = {"weekly": ("7d", WEEK), "5h": ("5h", timedelta(hours=5))}
+
+
+def google(url, token, body):
+    """One POST to Antigravity's backend, as T3 Code makes it; the token goes to this host and nowhere else."""
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers={
+        "Authorization": "Bearer " + token, "Content-Type": "application/json", "User-Agent": AGENT})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read())
+
+
+def google_error(error):
+    """A short phrase for a failed request; the error itself is never shown."""
+    if isinstance(error, urllib.error.HTTPError):
+        return ("Antigravity: вход отклонён, войди заново" if error.code in (401, 403)
+                else f"Antigravity не отвечает (HTTP {error.code})")
+    return "Antigravity: формат ответа не распознан" if isinstance(error, ValueError) else "Antigravity не отвечает"
+
+
+def antigravity_windows(groups, asked):
+    """Windows of Antigravity's quota summary, Gemini first and the week before 5h; labels of those without a number.
+
+    T3 Code's rule: a full window without a description whose reset lies one window after the request
+    has not been used, and that reset is no moment to count down to.
+    """
+    windows, missing, amounts = [], [], {}
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for bucket in group.get("buckets") or []:
+            if not isinstance(bucket, dict):
+                continue
+            ident, name = str(bucket.get("bucketId") or ""), str(group.get("displayName") or "")
+            pool = ("Gemini" if ident.startswith("gemini-") else "Cl/GPT" if ident.startswith("3p-")
+                    else re.sub(r"(?i)\s*\bmodels\b", "", name).strip()[:6] or "?")
+            period, length = PERIODS.get(bucket.get("window"), (str(bucket.get("window") or "?"), None))
+            label, fraction = f"{pool} {period}", bucket.get("remainingFraction")
+            # A disabled pool, a count without a fraction or junk is a gap, never 0% or 100%.
+            if bucket.get("disabled") is True or type(fraction) not in (int, float) or not 0 <= fraction <= 1:
+                missing.append(label)
+                if "remainingAmount" in bucket:
+                    amounts[label] = bucket["remainingAmount"]
+                continue
+            resets = parse_date(bucket.get("resetTime"))
+            untouched = (fraction == 1 and not bucket.get("description") and length and resets
+                         and abs((resets - asked - length).total_seconds()) <= 60)
+            resets_at = resets.isoformat() if resets and not untouched else None
+            windows.append({"label": label, "pct": 100.0 * (1 - fraction), "resets_at": resets_at,
+                            "clock": local_clock(resets_at), "ahead": False, "runs_out_at": None,
+                            "pool": pool, "period": period, "id": ident or None})
+    order = list(dict.fromkeys(w["pool"] for w in windows))
+    windows.sort(key=lambda w: (w["pool"] != "Gemini", order.index(w["pool"]), w["period"] != "7d"))
+    return windows, missing, amounts
+
+
+def antigravity_tier(token):
+    """The paid tier, else the current one, as Antigravity's backend names it; {} when it cannot tell."""
+    try:
+        answer = google(TIER_URL, token, {"metadata": {"ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED",
+                                                       "pluginType": "GEMINI"}})
+    except (OSError, ValueError, http.client.HTTPException):
+        return {}
+    tiers = [answer.get(key) for key in ("paidTier", "currentTier")] if isinstance(answer, dict) else []
+    tier = next((t for t in tiers if isinstance(t, dict) and isinstance(t.get("name"), str) and t["name"]), None)
+    return {"plan": tier["name"].removeprefix("Google "), "plan_id": tier.get("id")} if tier else {}
+
+
+def fetch_antigravity(previous=None):
+    """Google Antigravity accounts signed in on this Mac, read the way T3 Code does; None when there are none.
+
+    Sign-ins come from the keychain and T3 Code profiles into memory, and their tokens go only to Google:
+    `limits` never refreshes, stores or shows them. A failure stays on the account with its last numbers.
+    """
+    signins = antigravity_signins()
+    if not signins and not previous:
+        return None
+    cached = {acc["email"].casefold(): acc for acc in previous or []}
+    accounts = []
+    for signin in signins:
+        before = cached.pop(signin["email"].casefold(), {})
+        acc = {"provider": "antigravity", "email": signin["email"], "active": False, "fetched_at": None,
+               "error": "", "windows": [], **{field: before[field] for field in PLAN_FIELDS if field in before}}
+        accounts.append(acc)
+        asked = datetime.now(timezone.utc)
+        if signin["method"] != "consumer":
+            acc["error"] = "тип входа не поддерживается"
+            continue
+        # Like T3 Code, never refresh a personal sign-in: Antigravity renews it on its next turn.
+        if not signin["token"] or not signin["expires"] or (signin["expires"] - asked).total_seconds() <= 60:
+            acc["error"] = EXPIRED
+            continue
+        try:
+            answer = google(QUOTA_URL, signin["token"], {})  # an empty body: with a project Google leaves out Gemini
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            acc["error"] = google_error(error)
+            continue
+        groups = answer.get("groups") if isinstance(answer, dict) else None
+        if not isinstance(groups, list) and isinstance(answer, dict) and isinstance(answer.get("buckets"), list):
+            groups = [{"buckets": answer["buckets"]}]
+        if not isinstance(groups, list):
+            acc["error"] = "Antigravity: формат ответа не распознан"
+            continue
+        acc["windows"], acc["missing"], amounts = antigravity_windows(groups, asked)
+        acc["fetched_at"] = asked.isoformat(timespec="seconds")
+        if amounts:
+            acc["remaining_amount"] = amounts
+        attempted = parse_date(acc.get("plan_attempted_at"))
+        if not (attempted and asked - attempted < PLAN_EVERY):
+            acc["plan_attempted_at"] = acc["fetched_at"]
+            tier = antigravity_tier(signin["token"])
+            if tier:
+                acc.update(tier, plan_checked_at=acc["fetched_at"])
+    # An account whose sign-in is gone keeps its last numbers and says why.
+    return accounts + [{"provider": "antigravity", "email": acc["email"], "active": False, "fetched_at": None,
+                        "error": "вход не найден", "windows": []} for acc in cached.values()]
+
+
 def merge_last_good(old, fresh):
     if fresh is None:
         return old
@@ -282,29 +411,33 @@ def merge_last_good(old, fresh):
         if acc.get("error") and not acc["windows"] and before:
             acc["windows"] = before["windows"]
             acc["fetched_at"] = before.get("fetched_at")
+            # Antigravity's gaps and tier come with the same reading; a source's own fields are never replaced.
+            for field in ("missing", *PLAN_FIELDS):
+                if field in before:
+                    acc.setdefault(field, before[field])
     return fresh
 
 
-def cache_path():
-    return cache_dir() / "codex.json"
+def cache_path(provider="codex"):
+    return cache_dir() / f"{provider}.json"
 
 
-def load_codex_cache():
-    """Codex accounts from the previous run, so the screen need not wait for CodexBar."""
+def load_cache(provider):
+    """A slow source's accounts from the previous run, so the screen need not wait for it."""
     try:
-        accounts = json.loads(cache_path().read_text()).get("accounts")
+        accounts = json.loads(cache_path(provider).read_text()).get("accounts")
     except (OSError, ValueError, AttributeError):
         return None
     def valid(acc):
-        return (isinstance(acc, dict) and acc.get("provider") == "codex" and isinstance(acc.get("email"), str)
+        return (isinstance(acc, dict) and acc.get("provider") == provider and isinstance(acc.get("email"), str)
                 and isinstance(acc.get("windows"), list)
                 and all(isinstance(w, dict) and isinstance(w.get("label"), str)
                         and percentage(w.get("pct")) is not None for w in acc["windows"]))
     return accounts if isinstance(accounts, list) and accounts and all(map(valid, accounts)) else None
 
 
-def save_codex_cache(accounts):
-    path = cache_path()
+def save_cache(provider, accounts):
+    path = cache_path(provider)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as stream:
@@ -312,6 +445,24 @@ def save_codex_cache(accounts):
         os.replace(stream.name, path)
     except OSError:
         pass
+
+
+def load_codex_cache():
+    return load_cache("codex")
+
+
+def save_codex_cache(accounts):
+    save_cache("codex", accounts)
+
+
+def save_antigravity_cache(accounts):
+    """Each account's last clean reading; a failed poll never replaces one on disk. Tokens are never in it."""
+    kept = {acc["email"].casefold(): acc for acc in load_cache("antigravity") or []}
+    for acc in accounts or []:
+        if not acc.get("error") and acc["windows"]:
+            kept[acc["email"].casefold()] = acc
+    if kept:
+        save_cache("antigravity", list(kept.values()))
 
 
 def switch_account(slot):
@@ -412,14 +563,17 @@ def pace_alert(w, now, forecast=True):
 
 
 def notice_text(acc, age, now):
+    # A window the source gave no number for is named, not left out without a word.
+    gaps = "нет данных: " + ", ".join(acc["missing"]) if acc.get("missing") else ""
     if not acc["windows"]:
-        return acc.get("error") or "лимиты не получены"
+        return acc.get("error") or gaps or "лимиты не получены"
     observed = parse_date(acc.get("fetched_at"))
     if observed:
         age = (now - observed).total_seconds()
     if acc.get("error"):
         return acc["error"] + " · последние данные" + (f" {span(age)} назад" if age is not None else "")
-    return f"данные {span(age)} назад" if age is not None and age > STALE_AFTER else ""
+    stale = f"данные {span(age)} назад" if age is not None and age > STALE_AFTER else ""
+    return " · ".join(text for text in (stale, gaps) if text)
 
 
 def identity(acc, domain, subscription, now):
@@ -435,12 +589,13 @@ def identity(acc, domain, subscription, now):
     return rows + [f"{YELLOW if warn else DIM}{text}{RESET}"]
 
 
-def weekly_left(accounts, now):
-    """Weekly percent the accounts of one provider still have until the first of them resets.
+def weekly_left(accounts, now, pool=None):
+    """Weekly percent the accounts of one provider (one Antigravity pool) still have until the first of them resets.
 
     An account without a weekly reading is left out and counted, never taken as unused.
     """
-    weekly = [next((w for w in acc["windows"] if w["label"] == "7d"), None) for acc in accounts]
+    weekly = [next((w for w in acc["windows"] if w.get("period", w["label"]) == "7d" and w.get("pool") == pool),
+                   None) for acc in accounts]
     known = [w for w in weekly if w]
     if not known:
         return ""
@@ -467,16 +622,25 @@ def window_row(w, label_w, bar_w, reset_w, now):
             f"   {DIM}{countdown(w.get('resets_at'), now):>{reset_w}}{RESET}")
 
 
+def in_use(acc):
+    """Gemini rows always; another Antigravity pool once it has been used. `--json` keeps every window."""
+    used = {w.get("pool") for w in acc["windows"] if w["pct"] > 0 or w.get("resets_at")}
+    return dict(acc, windows=[w for w in acc["windows"] if w.get("pool") in (None, "Gemini") or w["pool"] in used])
+
+
 def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now=None,
-           cursor=None, status="", interactive=False):
+           cursor=None, status="", interactive=False, antigravity=None, antigravity_age=None):
     size = shutil.get_terminal_size((120, 40))
     width = max(1, size.columns - 1)
     now = now or datetime.now(timezone.utc)
     subscriptions = subscriptions or {}
+    antigravity = [in_use(acc) for acc in antigravity or []]
     groups = [(title, group, age) for title, group, age in
-              (("CLAUDE", claude, claude_age), ("CODEX", codex, codex_age)) if group]
+              (("CLAUDE", claude, claude_age), ("CODEX", codex, codex_age),
+               ("ANTIGRAVITY", antigravity, antigravity_age)) if group]
     accounts = [(acc, age) for _, group, age in groups for acc in group]
-    domain = shared_domain([acc for acc, _ in accounts])
+    # An account whose email is unknown has no domain to share or to break the sharing.
+    domain = shared_domain([acc for acc, _ in accounts if "@" in acc["email"]])
     idents = [identity(acc, domain, subscriptions.get(acc["provider"] + ":" + acc["email"].casefold(),
                                                      acc.get("subscription")), now)
               for acc, _ in accounts]
@@ -530,12 +694,20 @@ def render(claude, codex, claude_age, codex_age, errors, subscriptions=None, now
     reset_end = left_w + label_w + 2 + 4 + 2 + bar_w + 3 + reset_w
     def title_line(title, group):
         line = f"  {BOLD}{title}{RESET}"
-        left = weekly_left(group, now)
+        # Antigravity pools are separate limits, never summed: Gemini leads, another pool only with its rows.
+        pool = "Gemini" if group[0]["provider"] == "antigravity" else None
+        others = [w for acc in group for w in acc["windows"] if w.get("pool", pool) != pool and w.get("period") == "7d"]
+        parts = [weekly_left(group, now, pool)] + [
+            f"{name} {BOLD}{sum(max(0.0, 100 - w['pct']) for w in others if w['pool'] == name):.0f}%{RESET}"
+            for name in dict.fromkeys(w["pool"] for w in others)]
+        left = " · ".join(part for part in parts if part)
         if left:
             line += "   " + left
-        if not reset_w:
+        gap = reset_end - 11 - visible(line)
+        # The column title goes whole or not at all: a long header on a narrow screen leaves it out.
+        if not reset_w or gap < 2 or reset_end > width:
             return line
-        return line + " " * max(2, reset_end - 11 - visible(line)) + f"{DIM}сброс через{RESET}"
+        return line + " " * gap + f"{DIM}сброс через{RESET}"
 
     hint = ("↑↓ выбрать · Enter переключить · s статистика · r обновить · q выход" if interactive
             else "переключить Claude: cswap switch <номер>")
@@ -631,17 +803,21 @@ def snapshot(args, subscriptions, color):
     codex = fetch_codex()
     if codex is not None:
         save_codex_cache(codex)
+    # Cached accounts keep their last numbers through a failure and spare a tier check on every run.
+    previous = load_cache("antigravity")
+    antigravity = merge_last_good(previous, fetch_antigravity(previous))
+    save_antigravity_cache(antigravity)
     errors = [message for message in (claude_error, "" if codex is not None else CODEX_DOWN) if message]
     moment = datetime.now(timezone.utc)
-    claude, codex = roll_over(claude, moment), roll_over(codex, moment)
-    accounts = (claude or []) + (codex or [])
+    claude, codex, antigravity = (roll_over(group, moment) for group in (claude, codex, antigravity))
+    accounts = (claude or []) + (codex or []) + (antigravity or [])
     if args.json:
         for acc in accounts:
             acc["subscription"] = subscriptions.get(
                 acc["provider"] + ":" + acc["email"].casefold(), acc.get("subscription"))
         print(json.dumps({"accounts": accounts, "errors": errors}, ensure_ascii=False, indent=2))
     else:
-        frame = render(claude, codex, 0.0, 0.0, errors, subscriptions)
+        frame = render(claude, codex, 0.0, 0.0, errors, subscriptions, antigravity=antigravity, antigravity_age=0.0)
         print(frame if color else ANSI.sub("", frame))
     return 0 if any(a["windows"] for a in accounts) else 1
 
@@ -685,10 +861,11 @@ def live(subscriptions, color):
     # Like any full-screen tool: own screen, no cursor; the shell's screen returns on exit.
     sys.stdout.write("\033[?1049h\033[?25l")
     try:
-        failed = {"claude": "", "codex": "", "observe": "", "stats": ""}
-        sources = {"claude": (lambda: poll_claude(failed), CLAUDE_EVERY), "codex": (fetch_codex, CODEX_EVERY)}
-        data = {"claude": None, "codex": load_codex_cache()}
-        fetched = {"claude": 0.0, "codex": 0.0}
+        failed = {"claude": "", "codex": "", "antigravity": "", "observe": "", "stats": ""}
+        sources = {"claude": (lambda: poll_claude(failed), CLAUDE_EVERY), "codex": (fetch_codex, CODEX_EVERY),
+                   "antigravity": (lambda: fetch_antigravity(data["antigravity"]), ANTIGRAVITY_EVERY)}
+        data = {"claude": None, "codex": load_codex_cache(), "antigravity": load_cache("antigravity")}
+        fetched = {"claude": 0.0, "codex": 0.0, "antigravity": 0.0}
         jobs, cursor, note, note_until, refreshing = {}, None, "", 0.0, False
         # The statistics screen: measured on entry and every few minutes while it is open.
         view, tab, scroll, measured, measured_at = "limits", 0, 0, None, 0.0
@@ -716,15 +893,18 @@ def live(subscriptions, color):
                     failed[name] = f"статистика не посчитана: {error}" if error else ""
                     continue
                 fetched[name] = time.time()
-                if name == "claude":
-                    failed[name] = "" if error is None else str(error) if isinstance(error, FetchError) \
-                        else f"claude-swap: {error}"
-                else:
+                if name == "codex":
                     failed[name] = "" if result is not None else f"CodexBar: {error}" if error else CODEX_DOWN
+                else:
+                    # Antigravity without a sign-in or a cache returns None: no section and no error.
+                    failed[name] = "" if error is None else str(error) if isinstance(error, FetchError) \
+                        else f"{'claude-swap' if name == 'claude' else 'Antigravity'}: {error}"
                 data[name] = merge_last_good(data[name], result)
                 if name == "codex" and result is not None:
                     save_codex_cache(data["codex"])
-            refreshing = refreshing and ("claude" in jobs or "codex" in jobs)
+                if name == "antigravity" and result is not None:
+                    save_antigravity_cache(data["antigravity"])
+            refreshing = refreshing and any(name in jobs for name in sources)
 
             ready = select.select([fd], [], [], 0.2)[0] if fd is not None else time.sleep(0.2)
             pressed = os.read(fd, 64) if ready else None
@@ -768,6 +948,8 @@ def live(subscriptions, color):
             if not (changed or size != drawn_size or time.time() - drawn_at >= 10):
                 continue
             target = next((a for a in data["claude"] or [] if a.get("slot") == cursor), None)
+            loading = [title for name, title in (("codex", "Codex"), ("antigravity", "Antigravity"))
+                       if data[name] is None and name in jobs]
             if target and "switch" not in jobs:
                 status = (f"{short_name(target)} уже активный · Esc — отмена" if target["active"] else
                           f"Enter — переключиться на {cursor} {short_name(target)} · Esc — отмена")
@@ -775,12 +957,12 @@ def live(subscriptions, color):
                 status = note
             elif refreshing:
                 status = f"{DIM}обновляю…{RESET}"
-            elif data["codex"] is None and "codex" in jobs:
-                status = f"{DIM}Codex: загрузка…{RESET}"
+            elif loading:
+                status = f"{DIM}{', '.join(loading)}: загрузка…{RESET}"
             else:
                 status = ""
             moment = datetime.now(timezone.utc)
-            claude, codex = roll_over(data["claude"], moment), roll_over(data["codex"], moment)
+            claude, codex, antigravity = (roll_over(data[name], moment) for name in ("claude", "codex", "antigravity"))
             ages = {name: time.time() - fetched[name] if fetched[name] else None for name in fetched}
             if view == "stats":
                 waiting = ("считаю расход по транскриптам… первый раз около минуты" if measured is None
@@ -790,7 +972,8 @@ def live(subscriptions, color):
                 frame, scroll = screen(measured, tab, scroll, size.columns, size.lines, status)
             else:
                 frame = render(claude, codex, ages["claude"], ages["codex"], [m for m in failed.values() if m],
-                               subscriptions, cursor=cursor, status=status, interactive=fd is not None)
+                               subscriptions, cursor=cursor, status=status, interactive=fd is not None,
+                               antigravity=antigravity, antigravity_age=ages["antigravity"])
             if not color:
                 frame = ANSI.sub("", frame)
             # Overwrite in place inside a synchronized update instead of clearing: no flicker.
@@ -807,7 +990,7 @@ def live(subscriptions, color):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Лимиты и подписки Claude + Codex (включая профили Orca)")
+    parser = argparse.ArgumentParser(description="Лимиты и подписки Claude + Codex (включая профили Orca) + Antigravity")
     parser.add_argument("--once", action="store_true", help="один кадр и выход")
     parser.add_argument("--json", action="store_true", help="один снимок JSON")
     parser.add_argument("--no-color", action="store_true", help="без ANSI-цветов")
