@@ -172,10 +172,10 @@ class Accounts(unittest.TestCase):
                       bucket("img-day", "daily", remainingFraction=1.5)]}]
         windows, missing, amounts = watch.antigravity_windows(groups, asked)
         self.assertEqual([(w["label"], w["pct"], w["resets_at"]) for w in windows],
-                         [("Gemini 5h", 0.0, "2026-11-21T08:22:59+00:00"), ("Cl/GPT 7d", 0.0, None),
-                          ("Cl/GPT 5h", 100.0, "2026-11-21T05:00:00.500000+00:00")])
-        self.assertEqual(missing, ["Gemini 7d", "Image 7d", "Image 5h", "Image daily"])
-        self.assertEqual(amounts, {"Image 7d": 40})
+                         [("5h", 0.0, "2026-11-21T08:22:59+00:00"), ("C+G 7d", 0.0, None),
+                          ("C+G 5h", 100.0, "2026-11-21T05:00:00.500000+00:00")])
+        self.assertEqual(missing, ["7d", "Ima 7d", "Ima 5h", "Ima daily"])
+        self.assertEqual(amounts, {"Ima 7d": 40})
 
     def test_antigravity_tokens_stay_in_memory_and_the_tier_waits_12_hours(self):
         now = datetime.now(timezone.utc)

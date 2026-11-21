@@ -319,7 +319,9 @@ def antigravity_windows(groups, asked):
             pool = ("Gemini" if ident.startswith("gemini-") else "Cl/GPT" if ident.startswith("3p-")
                     else re.sub(r"(?i)\s*\bmodels\b", "", name).strip()[:6] or "?")
             period, length = PERIODS.get(bucket.get("window"), (str(bucket.get("window") or "?"), None))
-            label, fraction = f"{pool} {period}", bucket.get("remainingFraction")
+            # Gemini is the section's own limit and reads like Claude's and Codex's rows; other pools get a short tag.
+            tag = "" if pool == "Gemini" else "C+G" if pool == "Cl/GPT" else pool[:3]
+            label, fraction = f"{tag} {period}".strip(), bucket.get("remainingFraction")
             # A disabled pool, a count without a fraction or junk is a gap, never 0% or 100%.
             if bucket.get("disabled") is True or type(fraction) not in (int, float) or not 0 <= fraction <= 1:
                 missing.append(label)
