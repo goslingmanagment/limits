@@ -737,11 +737,13 @@ def measure(accounts, now=None):
                 total = spent(db, email, t0, until, scope)
                 if hit is not None and total["usd"] <= 0:
                     continue  # a hit the log pinned on the wrong account, moments after a switch
+                seg_from = t0
                 if hit is None and inside[0][1] - base >= 5 and pct - inside[0][1] >= MIN_BASELINE:
                     # The start of the segment was not watched: measure between the readings instead.
                     method, points = "разность", pct - inside[0][1]
-                    total = spent(db, email, inside[0][0], until, scope)
-                nobody = usd(None, t0, until, scope)
+                    seg_from = inside[0][0]
+                    total = spent(db, email, seg_from, until, scope)
+                nobody = usd(None, seg_from, until, scope)
                 first = db.execute("SELECT MIN(ts) FROM spend WHERE owner IS ? AND ts >= ? AND ts < ?",
                                    (email, t0, until)).fetchone()[0]
                 flags = []

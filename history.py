@@ -319,7 +319,7 @@ def build(out_dir=None):
     stored = read_csv(out_dir / "daily.csv")
     # A stored day already holds what the snapshot could add, split by tool; refilling it from
     # the snapshot after its transcripts moved away would trade that split for one coarse row.
-    restored = restore_from_ccusage(daily, skip_days={row[0] for row in stored})
+    restored = restore_from_ccusage(daily, skip_days={row[0] for row in stored if len(row) > 1 and row[1] == "claude"})
     print(f"Дополнено из сводок ccusage: {restored / 1e9:.2f} млрд токенов", flush=True)
 
     daily_header = ["date", "vendor", "tool", "account", "model", "scope", "requests", "input", "cache_read",
@@ -331,19 +331,20 @@ def build(out_dir=None):
     new_sessions = [[*key, fmt(s["first"]), fmt(s["last"]), s["n"], s["total"], s["output"], round(s["usd"], 4),
                      " ".join(sorted(s["models"]))] for key, s in sessions.items()]
 
-    # A stored day is replaced only by a fuller one, so moving transcripts away never lowers it.
-    by_day = defaultdict(lambda: [[], []])
+    # A stored (day, vendor) slice is replaced only by a fuller one, so moving one vendor's
+    # transcripts away never lowers it or blocks another vendor's new usage on the same day.
+    by_day_vendor = defaultdict(lambda: [[], []])
     for row in stored:
-        by_day[row[0]][0].append(row)
+        by_day_vendor[(row[0], row[1])][0].append(row)
     for row in new_daily:
-        by_day[row[0]][1].append(row)
-    kept_days = 0
+        by_day_vendor[(row[0], row[1])][1].append(row)
+    kept_days = set()
     merged = []
-    for date, (old, new) in by_day.items():
+    for (date, _vendor), (old, new) in by_day_vendor.items():
         total = lambda rows: sum(int(r[11]) for r in rows)
         if old and total(old) >= total(new):
             merged += old
-            kept_days += 1
+            kept_days.add(date)
         else:
             merged += new
     write_csv(out_dir / "daily.csv", daily_header, sorted(merged, key=lambda r: tuple(map(str, r[:6]))))
@@ -354,7 +355,7 @@ def build(out_dir=None):
         if key not in sessions_by_key or int(sessions_by_key[key][6]) <= row[6]:
             sessions_by_key[key] = row
     write_csv(out_dir / "sessions.csv", session_header, sorted(sessions_by_key.values(), key=lambda r: str(r[4])))
-    print(f"Дней оставлено из сохранённой копии: {kept_days}; модели без цены: {dict(unpriced) or 'нет'}", flush=True)
+    print(f"Дней оставлено из сохранённой копии: {len(kept_days)}; модели без цены: {dict(unpriced) or 'нет'}", flush=True)
     print(f"Готово: {out_dir / 'daily.csv'}, {out_dir / 'sessions.csv'}", flush=True)
     return 0
 

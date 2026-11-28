@@ -692,6 +692,61 @@ class Statistics(unittest.TestCase):
         self.assertEqual((five["method"], five["points"], five["spent"]["usd"]), ("уровень", 50.0, 0))
         self.assertIsNone(five["full"])
 
+    def test_difference_segment_only_counts_nobody_within_measured_span(self):
+        now, hour = self.NOW, timedelta(hours=1)
+        week = now + timedelta(days=4)
+        with contextlib.ExitStack() as stack:
+            home = self.home(stack)
+            (home / ".claude-swap-backup/claude-swap.log").write_text(
+                log_line(now - 200 * hour, "Added account 1: a@example.com (org: org-a)")
+                + log_line(now - 70 * hour, "Switched to unknown")
+                + log_line(now - 50 * hour, "Switched to account 1: a@example.com (org: org-a)"))
+            (home / ".claude/projects/p/t.jsonl").write_text(
+                reply(now - 60 * hour, output=10 * MILLION, msg="unseen_early")
+                + reply(now - 30 * hour, output=10 * MILLION, msg="seen"))
+            for hours, pct in ((40, 30), (1, 60)):
+                at = now - hours * hour
+                reading = [self.account("a@example.com", at, **{"7d": (pct, week)})]
+                worth.observe(reading, at.timestamp())
+            result = worth.measure(reading, now.timestamp())
+        weekly = result["rows"][0]
+        self.assertEqual(weekly["method"], "разность")
+        self.assertEqual(weekly["nobody_usd"], 0.0)
+
+    def test_history_merges_daily_csv_per_date_and_vendor(self):
+        import history
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            out.mkdir()
+            header = ["date", "vendor", "tool", "account", "model", "scope", "requests", "input",
+                      "cache_read", "cache_write", "output", "total", "usd_api"]
+            history.write_csv(out / "daily.csv", header, [
+                ["2026-11-20", "claude", "claude-code", "a@x", "claude-opus-5-5", "main", "10", "0", "0", "0", "5000", "5000", "1.0"],
+                ["2026-11-20", "codex", "codex", "", "gpt-6", "main", "1", "0", "0", "0", "100", "100", "0.1"],
+            ])
+            # Claude logs shrank (archived away), while Codex gained new usage on the same day.
+            fake_home = Path(tmp) / "home"
+            codex_sessions = fake_home / ".codex" / "sessions"
+            codex_sessions.mkdir(parents=True)
+            codex_ts = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+            (codex_sessions / "s.jsonl").write_text(
+                json.dumps({"type": "turn_context", "payload": {"model": "gpt-6"}}) + "\n"
+                + json.dumps({"timestamp": codex_ts, "type": "event_msg", "payload": {
+                    "type": "token_count",
+                    "info": {"last_token_usage": {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 800}}}}) + "\n"
+            )
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            with patch.object(history, "HOME", fake_home), \
+                 patch.object(history, "CLAUDE_ROOT", empty), \
+                 patch.object(history, "COWORK_ROOT", empty), \
+                 patch.object(history, "ORCA", empty), \
+                 patch.object(history, "ARCHIVE", empty), \
+                 patch.object(history, "restore_from_ccusage", return_value=0):
+                history.build(str(out))
+            rows = {r[1]: int(r[11]) for r in history.read_csv(out / "daily.csv")}
+        self.assertEqual(rows, {"claude": 5000, "codex": 800})
+
     def test_output_is_estimated_from_content_when_enough_replies_show_how(self):
         now = self.NOW
         with tempfile.TemporaryDirectory() as tmp:
